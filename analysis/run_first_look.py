@@ -1,4 +1,4 @@
-"""Execute a project notebook using the project-local Jupyter kernel."""
+"""Execute an analysis notebook using the project-local Jupyter kernel."""
 from datetime import datetime, timezone
 from pathlib import Path
 import os
@@ -18,7 +18,8 @@ from nbclient import NotebookClient
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("notebook", nargs="?", default="02_first_data_look.ipynb",
-                    choices=["01_remote_data_inventory.ipynb", "02_first_data_look.ipynb"])
+                    choices=["01_remote_data_inventory.ipynb", "02_first_data_look.ipynb",
+                             "03_xgboost_baseline.ipynb"])
 args = parser.parse_args()
 path = ANALYSIS / args.notebook
 notebook = nbformat.read(path, as_version=4)
