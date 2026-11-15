@@ -4,9 +4,10 @@ This is my analysis project for studying whether ML can tag beam-induced
 background (BIB) in ATLAS jet data while keeping jets from long-lived particles
 (LLPs).
 
-I have checked the files, made the first plots, and trained a first XGBoost
-baseline. The model study includes event-separated tests and checks for sample
-differences. It is an initial comparison, not a finished BIB tagger.
+I checked the data, trained an XGBoost baseline and compared it with models
+that read individual calorimeter cells. The [analysis guide](analysis/README.md)
+shows how to match the vertex counts and run the cell models. The results are
+exploratory and use one unpaired run and one simulated LLP sample.
 
 ## Code and data
 
