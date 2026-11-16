@@ -14,6 +14,7 @@ This project tests whether machine learning can tag beam-induced background
 | Compare scores | [compare_part_emil.py](analysis/compare_part_emil.py) | Applies ParT and the stored `jet_BIB_score` to the same test jets. |
 
 The [analysis guide](analysis/README.md) lists the input samples and commands.
+It also shows how [Set Transformer and Cluster Transformer compare with ParT](analysis/README.md#set-transformer-and-cluster-transformer).
 
 ## First comparison
 

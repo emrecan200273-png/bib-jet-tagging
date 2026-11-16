@@ -68,7 +68,7 @@ def _verify_event_keys(arrays, subset, event_index, context):
         raise ValueError(f"Saved run/event identity disagrees with the ROOT row: {context}")
 
 
-def _jet_cell_offsets(arrays, cell_fields, context):
+def _jet_cell_offsets(arrays, cell_fields, context, *, with_cluster_ids=False):
     def lengths(field):
         return ak.to_numpy(ak.num(arrays[field], axis=1), allow_missing=False)
 
@@ -90,7 +90,11 @@ def _jet_cell_offsets(arrays, cell_fields, context):
         raise ValueError(f"sum(jet_n_clusters) does not match the cluster count: {context}")
     if not np.array_equal(cluster_cell_offsets[event_cluster_offsets], _offsets(event_n_cells)):
         raise ValueError(f"sum(cluster_n_cells) does not match the cell count: {context}")
-    return event_n_jets, event_jet_offsets, cluster_cell_offsets[jet_cluster_offsets]
+    layout = (event_n_jets, event_jet_offsets, cluster_cell_offsets[jet_cluster_offsets])
+    if with_cluster_ids:
+        cluster_ids = np.repeat(np.arange(len(cluster_n_cells), dtype=np.int32), cluster_n_cells)
+        return (*layout, cluster_ids)
+    return layout
 
 
 def _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context):
@@ -109,19 +113,23 @@ def _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_o
     return jet_indices
 
 
-def read_jet_cell_spans(tree, subset, relative, *, cell_fields=CELL_BRANCHES):
-    """Return flat cell fields and aligned [start, stop) spans for one chunk."""
+def read_jet_cell_spans(tree, subset, relative, *, cell_fields=CELL_BRANCHES, with_cluster_ids=False):
+    """Return cell fields and jet spans, plus flat cluster IDs if requested."""
     rows, event_index = np.unique(subset["row_index"].to_numpy(), return_inverse=True)
     arrays, context = _read_rows(tree, (*JET_CELL_KEYS, *cell_fields), rows, relative)
     _verify_event_keys(arrays, subset, event_index, context)
-    event_n_jets, event_jet_offsets, offsets = _jet_cell_offsets(arrays, cell_fields, context)
+    event_n_jets, event_jet_offsets, offsets, *cluster_ids = _jet_cell_offsets(
+        arrays, cell_fields, context, with_cluster_ids=with_cluster_ids,
+    )
     jets = _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context)
     fields = np.column_stack([_flatten(arrays[field]) for field in cell_fields])
-    return fields, np.column_stack((offsets[jets], offsets[jets + 1]))
+    return fields, np.column_stack((offsets[jets], offsets[jets + 1])), *cluster_ids
 
 
-def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept):
-    flat_cells, spans = read_jet_cell_spans(tree, subset, relative)
+def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept, with_cluster_ids):
+    flat_cells, spans, *cluster_ids = read_jet_cell_spans(
+        tree, subset, relative, with_cluster_ids=with_cluster_ids,
+    )
     for i, (lo, hi) in zip(subset.index, spans, strict=True):
         row = flat_cells[lo:hi]
         stored[i] = len(row)
@@ -142,7 +150,11 @@ def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid
                                     z / 1000.0, d_eta, d_phi)).astype(np.float32)
         if not np.isfinite(features).all():
             raise ValueError(f"Nonfinite cell features for jet table row {i}: {relative}")
-        store_features(i, features)
+        local_ids = None
+        if with_cluster_ids:
+            _, local_ids = np.unique(cluster_ids[0][lo:hi][keep][top], return_inverse=True)
+            local_ids = local_ids.astype(np.int32, copy=False)
+        store_features(i, features, local_ids)
         energy_kept[i] = e_fraction.sum()
 
 
@@ -153,7 +165,7 @@ def _quantiles(values):
     return {f"p{int(p * 100):02d}": float(v) for p, v in zip(points, np.quantile(values, points), strict=True)}
 
 
-def extract_cells(jets, data_root, max_cells):
+def extract_cells(jets, data_root, max_cells, *, with_cluster_ids=False):
     """Return aligned (float32 cells, bool valid mask, JSON-ready audit).
 
     A True mask entry is an actual cell, False is padding. Missing or invalid
@@ -161,6 +173,8 @@ def extract_cells(jets, data_root, max_cells):
     original position with an all-False mask. A mismatch to the saved jet
     identity or a broken jet/cluster/cell count aborts the extraction. Pass
     None to keep all valid cells and pad only to the cohort's observed maximum.
+    With cluster IDs, the fourth result labels retained cells with consecutive
+    IDs in original cluster order; padding is -1.
     """
     if max_cells is not None:
         if (not isinstance(max_cells, (int, np.integer)) or isinstance(max_cells, (bool, np.bool_))
@@ -188,20 +202,26 @@ def extract_cells(jets, data_root, max_cells):
     data_root = Path(data_root).expanduser().resolve()
 
     def allocate(width):
-        return (np.zeros((len(frame), width, len(CELL_FEATURES)), dtype=np.float32),
-                np.zeros((len(frame), width), dtype=bool))
+        shape = (len(frame), width)
+        return (np.zeros((*shape, len(CELL_FEATURES)), dtype=np.float32), np.zeros(shape, dtype=bool),
+                np.full(shape, -1, dtype=np.int32) if with_cluster_ids else None)
 
-    def store_padded(i, features):
+    def store_padded(i, features, local_ids):
         n = len(features)
         cells[i, :n] = features
         mask[i, :n] = True
+        if with_cluster_ids:
+            cluster_ids[i, :n] = local_ids
+
+    def store_ragged(i, features, local_ids):
+        ragged[i] = features, local_ids
 
     if max_cells is None:
         # Discover the padding width without rereading the ROOT files.
         ragged = [None] * len(frame)
-        store_features = ragged.__setitem__
+        store_features = store_ragged
     else:
-        cells, mask = allocate(max_cells)
+        cells, mask, cluster_ids = allocate(max_cells)
         store_features = store_padded
     stored = np.full(len(frame), -1, dtype=np.int64)
     valid = np.zeros(len(frame), dtype=np.int64)
@@ -221,7 +241,8 @@ def extract_cells(jets, data_root, max_cells):
             if group["row_index"].max() >= tree.num_entries:
                 raise ValueError(f"Saved row_index is outside JetContent in {relative}")
             for _, subset in group.groupby(group["row_index"] // EVENTS_PER_CHUNK, sort=True):
-                _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept)
+                _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept,
+                            with_cluster_ids)
                 events_read += int(subset["row_index"].nunique())
                 chunks_read += 1
         files_read += 1
@@ -232,10 +253,10 @@ def extract_cells(jets, data_root, max_cells):
     observed_max = int(valid.max(initial=0))
     padded_width = observed_max if max_cells is None else max_cells
     if max_cells is None:
-        cells, mask = allocate(padded_width)
-        for i, features in enumerate(ragged):
-            if features is not None:
-                store_padded(i, features)
+        cells, mask, cluster_ids = allocate(padded_width)
+        for i, data in enumerate(ragged):
+            if data is not None:
+                store_padded(i, *data)
                 ragged[i] = None
 
     retained = mask.sum(axis=1)
@@ -295,4 +316,8 @@ def extract_cells(jets, data_root, max_cells):
             for (split, label), group in frame.groupby(["split", "label"], sort=True)
         ],
     }
+    if with_cluster_ids:
+        if not np.array_equal(cluster_ids >= 0, mask):
+            raise RuntimeError("Cluster IDs do not match retained cells")
+        return cells, mask, audit, cluster_ids
     return cells, mask, audit

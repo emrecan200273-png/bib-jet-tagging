@@ -108,6 +108,14 @@ def build_model(name, jet_dim, cell_dim, **options):
         from deep_cell_transformer import DeepCellTransformer
 
         return DeepCellTransformer(jet_dim, cell_dim, physics=name == "bib_cell_transformer", **options)
+    if name == "set_transformer":
+        from set_cell_transformer import SetCellTransformer
+
+        return SetCellTransformer(jet_dim, cell_dim)
+    if name == "cluster_transformer":
+        from cluster_cell_transformer import ClusterCellTransformer
+
+        return ClusterCellTransformer(jet_dim, cell_dim)
     raise ValueError(f"Unknown model {name!r}")
 
 

@@ -12,6 +12,7 @@ from cell_models import restore_model
 from data_paths import resolve_data_paths
 from train_xgboost import write_json
 from train_xgboost_vertex import kinematic_comparison, load_jets, make_comparison_plot, paired_interval, population
+from xgb_evaluation import jet_time_regions
 import numpy as np
 import pandas as pd
 import torch
@@ -22,8 +23,11 @@ PAIRWISE = "pairwise_transformer"
 PARTICLE_NET = "particle_net_lite"
 DEEP = "deep_cell_transformer"
 BIB = "bib_cell_transformer"
+SET = "set_transformer"
+CLUSTER = "cluster_transformer"
 DISPLAY_NAMES = {REFERENCE: "Transformer", PAIRWISE: "ParT-inspired", PARTICLE_NET: "ParticleNet-Lite",
-                 DEEP: "Two-block Transformer", BIB: "Two-block Transformer + BIB profile"}
+                 DEEP: "Two-block Transformer", BIB: "Two-block Transformer + BIB profile",
+                 SET: "Set Transformer", CLUSTER: "Cluster Transformer"}
 PARTICLE_NET_BATCH_CELLS = 8192
 
 
@@ -32,7 +36,12 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     outputs = root / "analysis/outputs"
     graph = architecture == PARTICLE_NET
     deep = architecture == DEEP
-    if deep:
+    advanced = architecture in (SET, CLUSTER)
+    if advanced:
+        references, trained = (PAIRWISE,), (architecture,)
+        previous_dir = outputs / "pairwise_cell_comparison"
+        output_dir = outputs / f"{architecture}_comparison"
+    elif deep:
         references, trained = (PAIRWISE,), (DEEP, BIB)
         previous_dir = outputs / "pairwise_cell_comparison"
         output_dir = outputs / "deep_cell_transformer_comparison"
@@ -78,7 +87,10 @@ def run_comparison(project_root, threads, architecture, output_override=None):
 
     torch.set_num_threads(threads)
     print(f"Extracting all cells for {len(jets):,} jets", flush=True)
-    cells, mask, audit = extract_cells(jets, data_root, None)
+    if architecture == CLUSTER:
+        cells, mask, audit, cluster_ids = extract_cells(jets, data_root, None, with_cluster_ids=True)
+    else:
+        cells, mask, audit = extract_cells(jets, data_root, None)
     if (audit["overall"]["truncated_jets"] or audit["overall"]["retained_cells"]
             != previous["cell_extraction"]["overall"]["retained_cells"]):
         raise ValueError("The extracted cell count differs from the saved comparison")
@@ -86,6 +98,14 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     jet_features = previous["jet_features"]
     scaling = previous["scaling_fit_on_train"]
     scalars = pilot.apply_scaling(jets[jet_features].to_numpy(dtype=np.float32), cells, mask, scaling)
+    cell_features = list(CELL_FEATURES)
+    if architecture == CLUSTER:
+        grouped_cells = np.empty((*cells.shape[:2], cells.shape[-1] + 1), dtype=np.float32)
+        grouped_cells[..., :-1] = cells
+        grouped_cells[..., -1] = cluster_ids
+        cells = grouped_cells
+        del grouped_cells, cluster_ids
+        cell_features.append("cluster_index")
     inputs = tuple(torch.from_numpy(array) for array in (scalars, cells, mask))
     lengths = inputs[2].sum(dim=1)
     labels = torch.from_numpy(jets["label"].to_numpy(dtype=np.float32))
@@ -116,7 +136,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         )
         model_path = output_dir / (f"{name}.pt" if deep else "neural_model.pt")
         saved = {"architecture": name, "model_options": model_options, "state_dict": model.state_dict(),
-                 "jet_features": jet_features, "cell_features": list(CELL_FEATURES), "scaling": scaling, "max_cells": None}
+                 "jet_features": jet_features, "cell_features": cell_features, "scaling": scaling, "max_cells": None}
         logits = {split: pilot.predict_logits(model, inputs, index, batch_size, lengths, max_batch_cells)
                   for split, index in indices.items()}
         validation_scores = logits["validation"].sigmoid().numpy().astype(np.float64)
@@ -147,6 +167,8 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         ) for label, metric in [(0, "llp_kept"), (1, "unpaired_tagged")]} for reference, name in pairs}
         if deep:
             paired[region] = {f"{name}_minus_{reference}": stats for (reference, name), stats in differences.items()}
+        elif advanced:
+            paired[region] = differences[(PAIRWISE, architecture)]
         elif graph:
             paired[region] = {reference: differences[(reference, PARTICLE_NET)] for reference in references}
         else:
@@ -156,10 +178,11 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     for name, score in test_scores.items():
         predictions[f"{name}_score"] = score
         predictions[f"{name}_tagged"] = score >= cuts[name]
-    bins, kinematic = kinematic_comparison(jets.iloc[indices["train"].numpy()], predictions, model_names=names)
+    train_frame = jets.iloc[indices["train"].numpy()]
+    bins, kinematic = kinematic_comparison(train_frame, predictions, model_names=names)
     report = {
         "inputs_sha256": hashes, "population": population(jets), "cell_extraction": audit,
-        "jet_features": jet_features, "cell_features": list(CELL_FEATURES),
+        "jet_features": jet_features, "cell_features": cell_features,
         "scaling_fit_on_train": scaling, "settings": {**settings, "threads": threads,
                                                        "max_cells_per_microbatch": max_batch_cells,
                                                        "model_options": model_options},
@@ -170,6 +193,17 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         "scope": "Exploratory comparison on the reused test split, one unpaired run and one LLP simulation. "
                  "Unpaired is a working BIB label. The neural architectures are adapted to calorimeter cells.",
     }
+    if advanced:
+        delayed_predictions = predictions.assign(**{
+            f"{name}_tagged": score >= delayed_cuts[name] for name, score in test_scores.items()
+        })
+        regions = jet_time_regions(test_frame)
+        delayed_masks = {key: regions[key] for key in ("delayed", "3_to_10_ns")}
+        delayed_bins, delayed_kinematic = kinematic_comparison(
+            train_frame, delayed_predictions, model_names=names, region_masks=delayed_masks,
+        )
+        delayed_bins.to_csv(output_dir / "kinematic_bins_delayed_cut.csv", index=False)
+        report["kinematic_comparison_at_delayed_validation_cut"] = delayed_kinematic
     predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)
     bins.to_csv(output_dir / "kinematic_bins.csv", index=False)
     results.to_csv(output_dir / "results.csv", index=False)
@@ -185,10 +219,16 @@ if __name__ == "__main__":
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--output-dir", type=Path, help="Write this run to a separate output folder")
     models = parser.add_mutually_exclusive_group()
-    models.add_argument("--particle-net-lite", action="store_true", help="Train ParticleNet-Lite and include both saved Transformers")
-    models.add_argument("--deep-transformers", action="store_true", help="Compare two-block Transformers with and without the BIB profile")
+    models.add_argument("--particle-net-lite", dest="architecture", action="store_const", const=PARTICLE_NET,
+                        help="Train ParticleNet-Lite and include both saved Transformers")
+    models.add_argument("--deep-transformers", dest="architecture", action="store_const", const=DEEP,
+                        help="Compare two-block Transformers with and without the BIB profile")
+    models.add_argument("--set-transformer", dest="architecture", action="store_const", const=SET,
+                        help="Train a Set Transformer with induced attention and compare against saved ParT")
+    models.add_argument("--cluster-transformer", dest="architecture", action="store_const", const=CLUSTER,
+                        help="Train a Transformer that pools cells within clusters and compare against saved ParT")
+    parser.set_defaults(architecture=PAIRWISE)
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("Threads must be positive")
-    architecture = DEEP if args.deep_transformers else PARTICLE_NET if args.particle_net_lite else PAIRWISE
-    print(run_comparison(args.project_root, args.threads, architecture, args.output_dir).to_string(index=False))
+    print(run_comparison(args.project_root, args.threads, args.architecture, args.output_dir).to_string(index=False))
