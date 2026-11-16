@@ -7,22 +7,19 @@ import json
 from pathlib import Path
 
 from train_xgboost import (
-    MODEL_FEATURES, balanced_weights, predict_model, score_saved_model, write_json,
+    MODEL_FEATURES, balanced_weights, fit_booster, predict_model, score_saved_model, write_json,
 )
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from xgboost import XGBClassifier
-from xgboost.callback import EarlyStopping
 
-from xgb_evaluation import choose_threshold, evaluate_scores
-from xgb_matching import ABS_ETA_EDGES, MIN_TRAIN_JETS_PER_CLASS_PER_BIN, PT_EDGES_GEV, _bin_indices
+from xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores
+from xgb_matching import ABS_ETA_EDGES, BIN_COLUMNS, PT_EDGES_GEV, add_kinematic_bins, supported_kinematic_bins
 
 
 MODEL_NAMES = ("baseline", "zero_vertex")
 DISPLAY_NAMES = {"baseline": "Original training", "zero_vertex": "Zero-vertex training"}
 SPLITS = ("train", "validation", "test")
-DELAYED_TIME_NS = 3.0
 JET_ID = ["event_group", "jet_index"]
 
 
@@ -96,22 +93,18 @@ def compare_region(frame, scores, thresholds, seed):
     return {"models": metrics, "paired_change": delta}
 
 
-def kinematic_comparison(train, predictions, model_names=MODEL_NAMES):
+def kinematic_comparison(train, predictions, model_names=MODEL_NAMES, *, region_masks=None):
     """Compare test rates within shared pT/|eta| bins at the main validation cuts."""
-    def bin_ids(frame):
-        return frame.assign(pt_bin=_bin_indices(frame["jet_pt_GeV"], PT_EDGES_GEV),
-                            eta_bin=_bin_indices(frame["jet_abs_eta"], ABS_ETA_EDGES))
-
-    keys = ["pt_bin", "eta_bin"]
-    train_counts = bin_ids(train).groupby([*keys, "label"]).size().unstack(fill_value=0)
-    supported = {key for key, counts in train_counts.iterrows()
-                 if min(key) >= 0 and counts.min() >= MIN_TRAIN_JETS_PER_CLASS_PER_BIN}
-    binned = bin_ids(predictions)
-    groups = {"all": binned, "delayed": binned.loc[binned["jet_time_ATLAS"].gt(DELAYED_TIME_NS)]}
+    supported = supported_kinematic_bins(add_kinematic_bins(train))
+    binned = add_kinematic_bins(predictions)
+    if region_masks is None:
+        region_masks = {"all": np.ones(len(binned), dtype=bool),
+                        "delayed": binned["jet_time_ATLAS"].gt(DELAYED_TIME_NS)}
     records, pooled = [], {}
-    for region, frame in groups.items():
+    for region, mask in region_masks.items():
+        frame = binned.loc[mask]
         rows = []
-        for (pt, eta), group in frame.groupby(keys, sort=True):
+        for (pt, eta), group in frame.groupby(BIN_COLUMNS, sort=True):
             if (pt, eta) not in supported:
                 continue
             llp = group["label"].eq(0)
@@ -188,13 +181,10 @@ def run_study(baseline_dir, vertex_path, output_dir):
 
     train_weights = balanced_weights(train["label"], train["label"])
     val_weights = balanced_weights(validation["label"], train["label"])
-    model = XGBClassifier(**baseline_metrics["training_parameters"], callbacks=[EarlyStopping(
-        rounds=baseline_metrics["early_stopping"]["rounds"],
-        metric_name="logloss", data_name="validation_1", save_best=True)])
     print(f"Training on {len(train):,} jets, including {train['label'].sum():,} zero-vertex unpaired jets", flush=True)
-    model.fit(train[features], train["label"], sample_weight=train_weights,
-              eval_set=[(train[features], train["label"]), (validation[features], validation["label"])],
-              sample_weight_eval_set=[train_weights, val_weights], verbose=False)
+    model = fit_booster(train, validation, features, baseline_metrics["training_parameters"],
+                        baseline_metrics["early_stopping"]["rounds"], train_weights, val_weights,
+                        include_train_eval=True)
 
     def scores_for(frame):
         baseline = score_saved_model(frame, baseline_dir)

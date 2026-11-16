@@ -61,6 +61,13 @@ def physical_invalid_mask(field, values):
     return invalid
 
 
+def tile_fraction_mask(values, *, require_mixed):
+    """Select both calorimeters, or allow pure Tile/LAr in the acceptance study."""
+    if require_mixed:
+        return (values > 0) & (values < 1)
+    return (values >= 0) & (values <= 1)
+
+
 def assign_event_splits(frame, seed=42):
     """Return a copy with stratified 60/20/20 train/validation/test event splits.
 
@@ -108,6 +115,23 @@ def assign_event_splits(frame, seed=42):
     return result
 
 
+def preserve_splits(expanded, old, seed):
+    """Keep known event splits and assign newly eligible events by a stable hash."""
+    assignment = old.drop_duplicates("event_group").set_index("event_group")["split"]
+    broad = expanded.copy()
+    prior = broad["event_group"].map(assignment)
+    changes = broad.loc[prior.notna() & broad["split"].ne(prior), "event_group"].nunique()
+
+    def new_split(key):
+        digest = hashlib.blake2b(f"{seed}:{key}".encode(), digest_size=8).digest()
+        value = int.from_bytes(digest, "big") / 2**64
+        return "train" if value < .6 else "validation" if value < .8 else "test"
+
+    new = {key: new_split(key) for key in broad.loc[prior.isna(), "event_group"].unique()}
+    broad["split"] = prior.fillna(broad["event_group"].map(new))
+    return broad, {"new_events": len(new), "old_events_that_a_fresh_split_would_move": int(changes)}
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -132,7 +156,7 @@ def _numeric_vector(arrays, field, jet_counts, context):
 
 def prepare_training_data(
     project_root, output_dir, *, seed=42, min_pt_GeV=30., max_abs_eta=1.7,
-    verify_hashes=True,
+    verify_hashes=True, require_mixed_calorimeters=True,
 ):
     """Extract all events in the two selected groups, apply cuts, and save a table.
 
@@ -143,6 +167,7 @@ def prepare_training_data(
         raise ValueError("min_pt_GeV must be finite and nonnegative")
     if not np.isfinite(max_abs_eta) or max_abs_eta <= 0:
         raise ValueError("max_abs_eta must be finite and positive")
+    calorimeter_stage = "mixed_calorimeters" if require_mixed_calorimeters else "valid_tile_fraction"
     project_root, output_dir = Path(project_root).resolve(), Path(output_dir).resolve()
     data_root, manifest_path = resolve_data_paths(project_root)
     data_root, manifest_path = data_root.resolve(), manifest_path.resolve()
@@ -243,9 +268,8 @@ def prepare_training_data(
                 flow["pt_cut"] += int(keep.sum())
                 keep &= np.abs(clean["jet_eta"]) < max_abs_eta
                 flow["eta_cut"] += int(keep.sum())
-                tile_fraction = clean["jet_TileEnergyFrac"]
-                keep &= (tile_fraction > 0) & (tile_fraction < 1)
-                flow["mixed_calorimeters"] += int(keep.sum())
+                keep &= tile_fraction_mask(clean["jet_TileEnergyFrac"], require_mixed=require_mixed_calorimeters)
+                flow[calorimeter_stage] += int(keep.sum())
                 if keep.any():
                     rows = np.repeat(np.arange(file_events, file_events + len(arrays)), jet_counts)
                     offsets = np.repeat(np.cumsum(jet_counts) - jet_counts, jet_counts)
@@ -286,7 +310,7 @@ def prepare_training_data(
     )
     flow_records = [
         {"sample": sample, "label": label, "stage": stage, "jets": int(cutflow[sample][stage])}
-        for sample, label in DATA_GROUPS.values() for stage in CUTFLOW_STAGES
+        for sample, label in DATA_GROUPS.values() for stage in [*CUTFLOW_STAGES[:-1], calorimeter_stage]
     ]
     sanitation_records = [
         {"sample": sample, "field": field, **dict(counts)}
@@ -319,8 +343,12 @@ def prepare_training_data(
             "min_pt_GeV_inclusive": float(min_pt_GeV),
             "max_abs_eta_exclusive": float(max_abs_eta),
             "finite_required": ["jet_pt_GeV", "jet_eta", "jet_time_ATLAS"],
-            "mixed_calorimeters": "0 < jet_TileEnergyFrac < 1, applied to both classes",
-            "mixed_calorimeter_reason": "Common mixed-energy support because LLP truth matching requires LAr and Tile cells; energy fractions are not a full reproduction of the matching criterion.",
+            "mixed_calorimeters": ("0 < jet_TileEnergyFrac < 1, applied to both classes" if require_mixed_calorimeters
+                                    else "0 <= jet_TileEnergyFrac <= 1, applied to both classes"),
+            "mixed_calorimeter_reason": (
+                "Common mixed-energy support because LLP truth matching requires LAr and Tile cells; energy fractions are not a full reproduction of the matching criterion."
+                if require_mixed_calorimeters else "Acceptance study includes jets with a single calorimeter's jet energy."
+            ),
             "llp_truth_match": "jet_is_llp_matched == 1",
             "time_definition": "Stored jet_time_ATLAS, unchanged; time unit ns",
             "energy_conversion": "jet_pt_GeV = stored jet_pt / 1000 (MeV to GeV)",

@@ -121,6 +121,29 @@ class MatchVertexTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not one-to-one"):
             match(self.cells, self.vertices)
 
+    def test_legacy_vertex_ids_are_recovered_only_by_explicit_bit_pattern_mode(self):
+        event = 2**31 + 5
+        with uproot.recreate(self.cells / "cells.root") as handle:
+            handle.mktree("JetContent", {
+                "runNumber": np.array([486706] * 4, dtype=np.int32),
+                "eventNumber": np.array([7, event, event + 2**32, event], dtype=np.uint64),
+                "lumiBlock": np.array([852, 852, 852, 884], dtype=np.int32),
+            })
+        with uproot.recreate(self.vertices / "vertices.root") as handle:
+            handle.mktree("BIB", {
+                "runNumber": np.array([486706] * 2, dtype=np.int32),
+                "eventNumber": np.array([7, event - 2**32], dtype=np.int32),
+                "lumiBlockNumber": np.array([852, 852], dtype=np.int32),
+                "nPrimaryVertices": np.array([0, 0], dtype=np.int32),
+            })
+        keys = dict(key_fields=("runNumber", "eventNumber", "lumiBlock"),
+                    vertex_keys=("runNumber", "eventNumber", "lumiBlockNumber"), matched_only=True)
+        _, default_rows = match(self.cells, self.vertices, **keys)
+        report, decoded_rows = match(self.cells, self.vertices, **keys, vertex_event_int32_bits=True)
+        self.assertEqual([row[6] for row in default_rows], ["matched", "unmatched", "unmatched", "unmatched"])
+        self.assertEqual([row[6] for row in decoded_rows], ["matched", "matched", "unmatched", "unmatched"])
+        self.assertEqual(report["matched_reinterpreted_negative_vertex_event_rows"], 1)
+
     def test_float_event_ids_are_rejected(self):
         self.save_cells([34], [99.0], dtype=np.float64)
         self.save_vertices([34], [99], [0])

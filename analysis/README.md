@@ -1,25 +1,16 @@
 # Analysis
 
-See the [project README](../README.md) for setup, data paths and the reference to Emil’s GitLab.
+See the [project README](../README.md) for setup and the XGBoost baseline.
+Run the commands below from the project folder.
 
-- [Notebook 1](01_remote_data_inventory.ipynb) checks file metadata and stored variables.
-- [Notebook 2](02_first_data_look.ipynb) reads a small sample and makes the first plots.
-- [Notebook 3](03_xgboost_baseline.ipynb) shows the first XGBoost study and its controls.
-- [Model options](model_options.md) contains short Swedish notes on the reference papers and possible next models.
-- `first_look.py` reads and checks the data; `first_look_plots.py` makes the figures.
-- `data_paths.py` lets the data and private manifest stay outside the repository.
-- `train_xgboost.py` runs the full first-model study. `xgb_data.py` checks and splits the data; `xgb_evaluation.py` evaluates the models; `xgb_matching.py` makes the separate kinematic check.
+## Prepare the vertex counts
 
-## Run the cell models
-
-Run these commands from the project root in the Python environment described in
-the project README. The vertex-count ROOT files come separately from CERNBox/EOS.
-For the data layout used in this study, prepare the jet table and vertex mapping
-as follows:
+The separate vertex files use the `BIB` tree. Match them to the cell files by
+run, event and luminosity block. The cell studies use unpaired events with zero
+reconstructed vertices and keep the original event splits.
 
 ```bash
 python -m pip install 'torch>=2.5,<3'
-python analysis/train_xgboost.py
 
 ppp_unpaired_dir="${PPP_DATA_ROOT:-DataForEmre}/non_collision/unpaired"
 python analysis/match_unpaired_vertices.py \
@@ -33,14 +24,7 @@ python analysis/match_unpaired_vertices.py \
 python analysis/train_xgboost_vertex.py
 ```
 
-The join writes `event_mapping.csv.gz`. The training code uses the run and event
-IDs to apply the vertex counts to the `unsplit_v2` jets in the baseline table.
-The cell models use unpaired events with zero reconstructed vertices as a
-BIB-enriched sample and keep the original event splits. The cell reader follows
-the stored jet-to-cluster-to-cell counts. The model inputs include the original
-stored cell times, relative cell energies and cell positions.
-
-Run the model comparisons in this order:
+## Train with cells
 
 ```bash
 python analysis/train_cell_models.py
@@ -50,12 +34,30 @@ python analysis/train_pairwise_cells.py --particle-net-lite
 python analysis/train_pairwise_cells.py --deep-transformers
 ```
 
-The first command trains a jet MLP, Deep Sets and a small Transformer. The next
-command compares the 64-cell pilot with runs using every valid stored cell.
-The remaining commands test cell-pair attention, ParticleNet-Lite and a two-block
-Transformer with and without differences derived from Emil's BIB time profile.
-The comparisons save test counts and plots under `analysis/outputs/`. The
-all-cell runs also report train–validation loss gaps. The threshold is chosen
-on validation. The delayed test subset uses ATLAS jet time above 3 ns.
+The first two commands compare the jet MLP, Deep Sets and a small Transformer
+with up to 64 cells per jet and with all valid stored cells. The other commands
+run ParT, ParticleNet-Lite and the deeper Transformer variants. Reports in
+`analysis/outputs/` include test results and the train–validation loss gap.
+The delayed region uses `jet_time_ATLAS > 3` ns.
 
-Raw data, local results and the private transfer records are ignored by Git. Locally executed notebooks keep their outputs; only notebook source is stored in Git.
+## Check the results
+
+| Script | What it checks |
+| --- | --- |
+| [study_jet_acceptance.py](study_jet_acceptance.py) | How the $p_T$, η and Tile cuts affect the samples and timing baseline |
+| [study_unpaired_runs.py](study_unpaired_runs.py) | How jet-level timing and kinematic controls transfer to other runs without cell input |
+| [study_bib_profiles.py](study_bib_profiles.py) | How the stored timing score compares with fits that try both beam directions |
+| [study_cell_inputs.py](study_cell_inputs.py) | How ParT responds when cell times are shuffled within each jet |
+| [compare_part_emil.py](compare_part_emil.py) | How frozen ParT and Emil scores compare on the same jets |
+
+Run the cell-input check after training ParT. Run the BIB profile study before
+the same-jet comparison so it can read the stored score cut. The comparison
+also reports results in shared $p_T$ and |η| bins and in the 3–10 ns window.
+
+For an independent run, pass `--run`, `--cell-dir` (a `JetContent` export) and
+`--vertex-dir` (the `BIB` sidecar) to `compare_part_emil.py`. Older sidecars
+can store unsigned event IDs in signed 32-bit fields. When verified on a pilot,
+use `--vertex-event-int32-bits` to recover the stored bits before matching them
+against the full event IDs in the cell files.
+
+See [model options](model_options.md) for notes on the papers.

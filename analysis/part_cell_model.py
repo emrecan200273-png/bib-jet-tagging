@@ -11,6 +11,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from cell_models import attention_key_mask, jet_classifier
+
 
 class PairwiseCellTransformer(nn.Module):
     """Add learned timing and geometry biases to cell-to-cell attention."""
@@ -42,11 +44,7 @@ class PairwiseCellTransformer(nn.Module):
         self.residual_dropout = nn.Dropout(self.dropout)
         self.readout_norm = nn.LayerNorm(self.width)
         self.readout_score = nn.Linear(self.width, 1)
-        self.classifier = nn.Sequential(
-            nn.Linear(jet_dim + self.width, 64), nn.SiLU(), nn.Dropout(self.dropout),
-            nn.Linear(64, 32), nn.SiLU(), nn.Dropout(self.dropout),
-            nn.Linear(32, 1),
-        )
+        self.classifier = jet_classifier(jet_dim + self.width, self.dropout)
 
     def _pair_bias(self, cells):
         """Evaluate an MLP on signed differences without a pair-feature grid."""
@@ -70,11 +68,7 @@ class PairwiseCellTransformer(nn.Module):
         else:
             valid = mask.bool()
             safe_cells = cells.masked_fill(~valid.unsqueeze(-1), 0)
-            # A temporary dummy key keeps attention/softmax finite in empty
-            # rows. The original mask removes it entirely from the readout.
-            empty = ~valid.any(dim=1, keepdim=True)
-            first = torch.arange(count, device=valid.device).eq(0).unsqueeze(0)
-            valid_keys = valid | (empty & first)
+            valid_keys, _ = attention_key_mask(valid)
 
             x = self.cell_projection(safe_cells)
             qkv = self.qkv(self.attention_norm(x)).reshape(batch, count, 3, self.heads, -1)

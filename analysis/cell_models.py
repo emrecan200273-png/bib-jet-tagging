@@ -11,22 +11,30 @@ WIDTH = 32
 DROPOUT = 0.1
 
 
-def _classifier(input_dim):
+def jet_classifier(input_dim, dropout=DROPOUT):
+    """Build the shared classifier head for the MLP, set and attention models."""
     return nn.Sequential(
         nn.Linear(input_dim, 64),
         nn.SiLU(),
-        nn.Dropout(DROPOUT),
+        nn.Dropout(dropout),
         nn.Linear(64, 32),
         nn.SiLU(),
-        nn.Dropout(DROPOUT),
+        nn.Dropout(dropout),
         nn.Linear(32, 1),
     )
+
+
+def attention_key_mask(valid):
+    """Keep a temporary attention key for a row with no valid cells."""
+    empty = ~valid.any(dim=1, keepdim=True)
+    first = torch.arange(valid.shape[1], device=valid.device).eq(0).unsqueeze(0)
+    return valid | (empty & first), empty
 
 
 class JetMLP(nn.Module):
     def __init__(self, jet_dim):
         super().__init__()
-        self.classifier = _classifier(jet_dim)
+        self.classifier = jet_classifier(jet_dim)
 
     def forward(self, jets, cells, mask):
         return self.classifier(jets).squeeze(-1)
@@ -41,7 +49,7 @@ class DeepSets(nn.Module):
             nn.Linear(WIDTH, WIDTH),
             nn.SiLU(),
         )
-        self.classifier = _classifier(jet_dim + 2 * WIDTH)
+        self.classifier = jet_classifier(jet_dim + 2 * WIDTH)
 
     def forward(self, jets, cells, mask):
         valid = mask.bool().unsqueeze(-1)
@@ -67,7 +75,7 @@ class CellTransformer(nn.Module):
             d_model=WIDTH, nhead=4, dim_feedforward=64, dropout=DROPOUT,
             activation="gelu", batch_first=True,
         )
-        self.classifier = _classifier(jet_dim + WIDTH)
+        self.classifier = jet_classifier(jet_dim + WIDTH)
 
     def forward(self, jets, cells, mask):
         valid = mask.bool()
@@ -101,3 +109,10 @@ def build_model(name, jet_dim, cell_dim, **options):
 
         return DeepCellTransformer(jet_dim, cell_dim, physics=name == "bib_cell_transformer", **options)
     raise ValueError(f"Unknown model {name!r}")
+
+
+def restore_model(name, jet_dim, cell_dim, state_dict, **options):
+    """Build a model and load its saved parameters and buffers."""
+    model = build_model(name, jet_dim, cell_dim, **options)
+    model.load_state_dict(state_dict)
+    return model

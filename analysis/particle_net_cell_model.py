@@ -12,7 +12,7 @@ from torch import nn
 
 
 def _neighbors(points, valid, k, *, angular):
-    """Return up to k non-self neighbors, with an explicit valid-edge mask."""
+    """Find neighbors and use canonical cell order to break equal distances."""
     batch, count, _ = points.shape
     neighbors = min(k, max(count - 1, 0))
     if neighbors == 0:
@@ -29,11 +29,28 @@ def _neighbors(points, valid, k, *, angular):
             dphi.add_(math.pi).remainder_(2 * math.pi).sub_(math.pi)
             distance = deta.square_().add_(dphi.square_())
         else:
-            distance = torch.cdist(points, points)
+            # Use the same distance calculation for short and padded batches.
+            distance = torch.cdist(points, points, compute_mode="donot_use_mm_for_euclid_dist")
         distance.masked_fill_(~valid.unsqueeze(1), torch.inf)
         distance.diagonal(dim1=1, dim2=2).fill_(torch.inf)
-        nearest, indices = distance.topk(neighbors, dim=-1, largest=False, sorted=False)
+        indices = distance.argsort(dim=-1, stable=True)[..., :neighbors].contiguous()
+        nearest = distance.gather(-1, indices)
         return indices, valid.unsqueeze(-1) & torch.isfinite(nearest)
+
+
+def _canonical_cell_order(cells, valid):
+    """Give equal-distance neighbors a tie-break independent of storage order."""
+    # Cells can share an angular position in different calorimeter layers.
+    # Sort valid cells by geometry, then energy and time. If every feature
+    # agrees, exchanging the cells cannot change the information in an edge.
+    geometry_then_measurements = (4, 5, 2, 3, 1, 0)
+    with torch.no_grad():
+        order = torch.arange(cells.shape[1], device=cells.device).expand(cells.shape[0], -1)
+        for feature in reversed(geometry_then_measurements):
+            ranks = cells[..., feature].gather(1, order).argsort(dim=1, stable=True)
+            order = order.gather(1, ranks)
+        ranks = (~valid.gather(1, order)).to(torch.uint8).argsort(dim=1, stable=True)
+        return order.gather(1, ranks)
 
 
 class _EdgeConv(nn.Module):
@@ -92,6 +109,9 @@ class ParticleNetLiteCells(nn.Module):
         else:
             valid = mask.bool()
             features = cells.masked_fill(~valid.unsqueeze(-1), 0)
+            order = _canonical_cell_order(features, valid)
+            valid = valid.gather(1, order)
+            features = features.gather(1, order.unsqueeze(-1).expand_as(features))
             # Only differences enter the first graph, so restoring the scales
             # (without the training centers) recovers physical angle distances.
             angles = features[..., 4:6] * self.angular_scale

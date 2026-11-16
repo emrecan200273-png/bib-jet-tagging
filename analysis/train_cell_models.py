@@ -27,7 +27,7 @@ import pandas as pd
 
 from cell_jet_data import CELL_FEATURES, extract_cells
 from cell_generalization import plot_learning_curves, summarize_generalization
-from cell_models import build_model
+from cell_models import build_model, restore_model
 from data_paths import resolve_data_paths
 from xgb_evaluation import choose_threshold, evaluate_scores
 
@@ -36,6 +36,27 @@ DISPLAY_NAMES = {"xgboost": "XGBoost", "jet_mlp": "Jet MLP", "deep_sets": "Deep 
 FULL_CELL_NAMES = {"deep_sets_64": "Deep Sets · 64", "deep_sets_all": "Deep Sets · all",
                    "transformer_64": "Transformer · 64", "transformer_all": "Transformer · all"}
 MAX_ATTENTION_PAIRS = 2_000_000
+JET_IDENTITY = ["event_group", "source_file", "row_index", "jet_index"]
+
+
+def split_indices(jets):
+    """Read the existing split assignments without reshuffling events."""
+    return {split: torch.from_numpy(np.flatnonzero(jets["split"].eq(split))) for split in SPLITS}
+
+
+def input_hashes(paths):
+    hashes = {}
+    for path in paths:
+        with path.open("rb") as handle:
+            hashes[str(path)] = hashlib.file_digest(handle, "sha256").hexdigest()
+    return hashes
+
+
+def validation_cuts(frame, scores, target):
+    """Choose operating points on full and delayed validation jets."""
+    delayed = frame["jet_time_ATLAS"].gt(DELAYED_TIME_NS).to_numpy()
+    return (choose_threshold(frame["label"], scores, target),
+            choose_threshold(frame.loc[delayed, "label"], scores[delayed], target))
 
 
 def apply_scaling(jets, cells, mask, scaling):
@@ -174,8 +195,9 @@ def replay_capped_models(pilot, jets, jet_values, cells, mask, indices, identity
         torch.set_num_threads(report["settings"]["threads"])
         for architecture in ("deep_sets", "transformer"):
             name = f"{architecture}_64"
-            model = build_model(architecture, capped_jets.shape[-1], capped_cells.shape[-1])
-            model.load_state_dict(checkpoint["state_dicts"][architecture])
+            model = restore_model(
+                architecture, capped_jets.shape[-1], capped_cells.shape[-1], checkpoint["state_dicts"][architecture],
+            )
             logits[name] = {split: predict_logits(model, inputs, index, report["settings"]["batch_size"])
                             for split, index in indices.items()}
             test_scores[name] = saved_test[f"{architecture}_score"].to_numpy()
@@ -187,12 +209,16 @@ def replay_capped_models(pilot, jets, jet_values, cells, mask, indices, identity
     return report, logits, histories, test_scores
 
 
-def compare_test_scores(test_frame, test_scores, thresholds, delayed_thresholds, seed):
+def evaluation_regions(test_frame, thresholds, delayed_thresholds):
     delayed = test_frame["jet_time_ATLAS"].gt(DELAYED_TIME_NS).to_numpy()
-    all_jets = np.ones(len(test_frame), dtype=bool)
+    return (("all", np.ones(len(test_frame), dtype=bool), thresholds),
+            ("delayed", delayed, thresholds),
+            ("delayed_at_delayed_validation_target", delayed, delayed_thresholds))
+
+
+def compare_test_scores(test_frame, test_scores, thresholds, delayed_thresholds, seed):
     comparisons, rows = {}, []
-    for region, subset, cuts in [("all", all_jets, thresholds), ("delayed", delayed, thresholds),
-                                 ("delayed_at_delayed_validation_target", delayed, delayed_thresholds)]:
+    for region, subset, cuts in evaluation_regions(test_frame, thresholds, delayed_thresholds):
         comparisons[region] = {}
         for name in thresholds:
             metrics = evaluate_scores(test_frame.loc[subset], test_scores[name][subset], cuts[name],
@@ -226,10 +252,10 @@ def run_pilot(project_root, max_cells, max_epochs, batch_size, threads):
     seed, target = previous["seed"], previous["target_llp_keep_on_validation"]
     _, jets = load_jets(baseline / "training_jets.csv.gz", vertex_path)
     jets = jets.reset_index(drop=True)
-    train, validation, test = (np.flatnonzero(jets["split"].eq(split)) for split in SPLITS)
-    indices = dict(zip(SPLITS, map(torch.from_numpy, (train, validation, test)), strict=True))
-    val_frame, test_frame = jets.iloc[validation], jets.iloc[test]
-    identity = ["event_group", "source_file", "row_index", "jet_index"]
+    indices = split_indices(jets)
+    train = indices["train"].numpy()
+    val_frame, test_frame = (jets.iloc[indices[split].numpy()] for split in ("validation", "test"))
+    identity = JET_IDENTITY
     prior_test = pd.read_csv(clean_xgb / "test_predictions.csv.gz")
     if not test_frame[identity].reset_index(drop=True).equals(prior_test[identity]):
         raise ValueError("The test jets differ from the vertex study")
@@ -268,10 +294,9 @@ def run_pilot(project_root, max_cells, max_epochs, batch_size, threads):
         if not np.array_equal(test_scores["xgboost"], prior_test["zero_vertex_score"].to_numpy()):
             raise ValueError("The saved XGBoost scores differ from the vertex study")
 
-    thresholds = {name: choose_threshold(val_frame["label"], val_scores[name], target) for name in display_names}
-    delayed_val = val_frame["jet_time_ATLAS"].gt(DELAYED_TIME_NS).to_numpy()
-    delayed_thresholds = {name: choose_threshold(val_frame.loc[delayed_val, "label"], val_scores[name][delayed_val], target)
-                          for name in display_names}
+    thresholds, delayed_thresholds = {}, {}
+    for name in display_names:
+        thresholds[name], delayed_thresholds[name] = validation_cuts(val_frame, val_scores[name], target)
     if all_cells:
         for architecture in ("deep_sets", "transformer"):
             name = f"{architecture}_64"
@@ -290,18 +315,14 @@ def run_pilot(project_root, max_cells, max_epochs, batch_size, threads):
         predictions[f"{name}_score"] = test_scores[name]
         predictions[f"{name}_tagged"] = test_scores[name] >= thresholds[name]
     bins, kinematic = kinematic_comparison(jets.iloc[train], predictions, model_names=display_names)
-    inputs_sha256 = {}
     sources = [baseline / "training_jets.csv.gz", vertex_path, clean_xgb / "feature_schema.json",
                clean_xgb / "test_predictions.csv.gz", manifest]
     if all_cells:
         sources += [capped_pilot / name for name in ("neural_models.pt", "test_predictions.csv.gz", "metrics.json")]
     else:
         sources.append(clean_xgb / "xgboost.ubj")
-    for path in sources:
-        with path.open("rb") as handle:
-            inputs_sha256[str(path)] = hashlib.file_digest(handle, "sha256").hexdigest()
     report = {
-        "population": population(jets), "cell_extraction": audit, "inputs_sha256": inputs_sha256,
+        "population": population(jets), "cell_extraction": audit, "inputs_sha256": input_hashes(sources),
         "jet_features": spec["features"], "cell_features": list(CELL_FEATURES), "scaling_fit_on_train": scaling,
         "settings": {"seed": seed, "max_cells": max_cells, "max_epochs": max_epochs, "batch_size": batch_size,
                      "threads": threads, "optimizer": "AdamW", "lr": 1e-3, "weight_decay": 1e-4, "early_stop_patience": 5,
@@ -331,8 +352,7 @@ def run_pilot(project_root, max_cells, max_epochs, batch_size, threads):
     torch.save(checkpoint, path)
     saved = torch.load(path, weights_only=True)
     for name, state in saved["state_dicts"].items():
-        restored = build_model(architectures[name], scalars.shape[-1], cells.shape[-1])
-        restored.load_state_dict(state)
+        restored = restore_model(architectures[name], scalars.shape[-1], cells.shape[-1], state)
         if not np.array_equal(evaluate_model(restored, inputs, indices["test"], batch_size, lengths=lengths), test_scores[name]):
             raise AssertionError(f"Reloaded {name} predictions differ")
     predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)

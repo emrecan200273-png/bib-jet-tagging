@@ -47,21 +47,20 @@ def select_tree(handle, path, key_fields, vertex_fields=(), preferred=None, expl
         for name, kind in handle.classnames(recursive=True, cycle=False).items()
         if kind in TREE_TYPES
     }
+    required = set(key_fields)
     eligible = []
     for name, tree in trees.items():
-        branches = set(tree.keys())
         if explicit and name != explicit:
             continue
-        if not set(key_fields) <= branches:
+        branches = set(tree.keys())
+        if not required <= branches:
             continue
         if vertex_fields:
             eligible.extend((name, tree, branch) for branch in vertex_fields if branch in branches)
         else:
             eligible.append((name, tree, None))
     if preferred and not explicit:
-        preferred_matches = [item for item in eligible if item[0] == preferred]
-        if preferred_matches:
-            eligible = preferred_matches
+        eligible = [item for item in eligible if item[0] == preferred] or eligible
     if len(eligible) == 1:
         return eligible[0]
     if eligible:
@@ -131,9 +130,17 @@ def read_file(tree, path, relative_path, key_fields, vertex_field):
             yield Row(relative_path, offset + index, key, value)
 
 
-def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, target_keys, counts):
+def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, target_keys, counts,
+                          *, signed_event_column=None):
     """Count every raw row; materialize only rows that match a local cell key."""
     for offset, ids, values in read_chunks(tree, path, key_fields, vertex_field):
+        if signed_event_column is not None:
+            events = ids[signed_event_column]
+            if events.dtype != np.dtype("int32"):
+                raise ValueError(f"{path}: eventNumber must be signed int32 in bit-pattern mode")
+            negative_events = np.ma.filled(events < 0, False)
+            counts["reinterpreted_negative_vertex_event_rows"] += int(negative_events.sum())
+            ids[signed_event_column] = events.astype(np.uint32)
         size = len(values)
         counts["vertex_rows"] += size
         data = np.ma.getdata(values)
@@ -159,11 +166,100 @@ def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, t
             matching_rows = valid_rows[:0]
         counts["matched_vertex_rows"] += len(matching_rows)
         counts["vertex_only_rows"] += len(valid_rows) - len(matching_rows)
+        if signed_event_column is not None:
+            counts["matched_reinterpreted_negative_vertex_event_rows"] += int(negative_events[matching_rows].sum())
         for index in matching_rows:
             yield Row(
                 relative_path, offset + int(index),
                 tuple(int(column[index]) for column in ids), raw_count(values[index]),
             )
+
+
+def _index_cells(files, directory, key_fields, tree_name, counts):
+    tree_counts = Counter()
+    rows, by_key = [], {}
+    for path in files:
+        with uproot.open(path) as handle:
+            name, tree, _ = select_tree(handle, path, key_fields, preferred="JetContent", explicit=tree_name)
+            tree_counts[name] += 1
+            for row in read_file(tree, path, str(path.relative_to(directory)), key_fields, None):
+                counts["cell_rows"] += 1
+                rows.append(row)
+                if None in row.key:
+                    counts["invalid_cell_key_rows"] += 1
+                    continue
+                previous = by_key.get(row.key)
+                if previous is not None:
+                    raise ValueError(
+                        f"Duplicate cell event {row.key}: {previous.file}, entry {previous.entry} "
+                        f"and {row.file}, entry {row.entry}; the match is not one-to-one"
+                    )
+                by_key[row.key] = row
+    return rows, by_key, tree_counts
+
+
+def _index_vertices(files, directory, key_fields, tree_name, branch, target_keys, counts, signed_event_column):
+    matched_only = target_keys is not None
+    tree_counts, vertices = Counter(), {}
+    for path in files:
+        with uproot.open(path) as handle:
+            candidates = (branch,) if branch else VERTEX_NAMES
+            name, tree, branch = select_tree(handle, path, key_fields, candidates, explicit=tree_name)
+            if branch in key_fields:
+                raise ValueError(f"{path}: the vertex-count branch must be separate from the event key")
+            tree_counts[name] += 1
+            source = str(path.relative_to(directory))
+            if matched_only:
+                rows = read_matched_vertices(tree, path, source, key_fields, branch, target_keys, counts,
+                                             signed_event_column=signed_event_column)
+            else:
+                rows = read_file(tree, path, source, key_fields, branch)
+            for row in rows:
+                if not matched_only:
+                    counts["vertex_rows"] += 1
+                    counts["invalid_vertex_count_rows"] += valid_count(row.value) is None
+                    if None in row.key:
+                        counts["invalid_vertex_key_rows"] += 1
+                        continue
+                previous = vertices.get(row.key)
+                if previous is None:
+                    vertices[row.key] = row
+                elif previous.value != row.value:
+                    raise ValueError(
+                        f"Conflicting vertex counts for event {row.key}: "
+                        f"{previous.value!r} ({previous.file}, entry {previous.entry}) and "
+                        f"{row.value!r} ({row.file}, entry {row.entry})"
+                    )
+                else:
+                    counts["duplicate_vertex_rows"] += 1
+    return vertices, tree_counts, branch
+
+
+def _join_events(cell_rows, vertices, counts):
+    records = []
+    for row in cell_rows:
+        sidecar = vertices.get(row.key)
+        count = None
+        if None in row.key:
+            status = "invalid_cell_key"
+        elif sidecar is None:
+            counts["unmatched_cell_events"] += 1
+            status = "unmatched"
+        else:
+            counts["key_matched_events"] += 1
+            count = valid_count(sidecar.value)
+            if count is None:
+                counts["matched_invalid_vertex_count"] += 1
+                status = "invalid_vertex_count"
+            else:
+                counts["matched_valid_vertex_count"] += 1
+                counts["matched_zero_vertex_count"] += count == 0
+                status = "matched"
+        records.append((
+            row.file, row.entry, *row.key, count, status,
+            sidecar.file if sidecar else None, sidecar.entry if sidecar else None,
+        ))
+    return records
 
 
 def match(
@@ -176,6 +272,7 @@ def match(
     cell_tree=None,
     vertex_tree=None,
     matched_only=False,
+    vertex_event_int32_bits=False,
 ):
     cell_dir, vertex_dir = Path(cell_dir).resolve(), Path(vertex_dir).resolve()
     if cell_dir == vertex_dir or cell_dir in vertex_dir.parents or vertex_dir in cell_dir.parents:
@@ -189,6 +286,11 @@ def match(
         or len(set(vertex_keys)) != len(vertex_keys)
     ):
         raise ValueError("Cell and vertex keys must list the same number of distinct fields")
+    signed_event_column = None
+    if vertex_event_int32_bits:
+        if not matched_only or "eventNumber" not in vertex_keys:
+            raise ValueError("Vertex event bit-pattern mode requires matched-only mode and an eventNumber key")
+        signed_event_column = vertex_keys.index("eventNumber")
     cell_files, vertex_files = root_files(cell_dir), root_files(vertex_dir)
     counts = Counter(dict.fromkeys((
         "cell_rows", "vertex_rows", "invalid_cell_key_rows", "invalid_vertex_key_rows",
@@ -196,91 +298,19 @@ def match(
         "matched_valid_vertex_count", "matched_zero_vertex_count", "matched_invalid_vertex_count",
         "unmatched_cell_events", "vertex_only_event_keys", "vertex_only_valid_counts",
     ), 0))
-    cell_trees, vertex_trees = Counter(), Counter()
-    cells = {}
-    cell_rows = []
-    for path in cell_files:
-        with uproot.open(path) as handle:
-            name, tree, _ = select_tree(handle, path, key_fields, preferred="JetContent", explicit=cell_tree)
-            cell_trees[name] += 1
-            for row in read_file(tree, path, str(path.relative_to(cell_dir)), key_fields, None):
-                counts["cell_rows"] += 1
-                cell_rows.append(row)
-                if None in row.key:
-                    counts["invalid_cell_key_rows"] += 1
-                    continue
-                previous = cells.get(row.key)
-                if previous is not None:
-                    raise ValueError(
-                        f"Duplicate cell event {row.key}: {previous.file}, entry {previous.entry} "
-                        f"and {row.file}, entry {row.entry}; the match is not one-to-one"
-                    )
-                cells[row.key] = row
-
+    cell_rows, cells, cell_trees = _index_cells(cell_files, cell_dir, key_fields, cell_tree, counts)
+    target_keys = None
     if matched_only:
-        # A structured integer key keeps every bit of each component, including uint64 IDs.
+        # Keep every bit of each uint64 event key.
         key_dtype = np.dtype([(f"k{i}", np.uint64) for i in range(len(key_fields))])
         target_keys = np.array(sorted(cells), dtype=key_dtype)
         counts.update({"matched_vertex_rows": 0, "vertex_only_rows": 0})
-    vertices = {}
-    for path in vertex_files:
-        with uproot.open(path) as handle:
-            branch_candidates = (vertex_branch,) if vertex_branch else VERTEX_NAMES
-            name, tree, branch = select_tree(handle, path, vertex_keys, branch_candidates, explicit=vertex_tree)
-            if branch in vertex_keys:
-                raise ValueError(f"{path}: the vertex-count branch must be separate from the event key")
-            vertex_branch = branch
-            vertex_trees[name] += 1
-            source = str(path.relative_to(vertex_dir))
-            if matched_only:
-                rows = read_matched_vertices(tree, path, source, vertex_keys, branch, target_keys, counts)
-            else:
-                rows = read_file(tree, path, source, vertex_keys, branch)
-            for row in rows:
-                if not matched_only:
-                    counts["vertex_rows"] += 1
-                    if valid_count(row.value) is None:
-                        counts["invalid_vertex_count_rows"] += 1
-                    if None in row.key:
-                        counts["invalid_vertex_key_rows"] += 1
-                        continue
-                previous = vertices.get(row.key)
-                if previous is not None:
-                    if previous.value != row.value:
-                        raise ValueError(
-                            f"Conflicting vertex counts for event {row.key}: "
-                            f"{previous.value!r} ({previous.file}, entry {previous.entry}) and "
-                            f"{row.value!r} ({row.file}, entry {row.entry})"
-                        )
-                    counts["duplicate_vertex_rows"] += 1
-                    continue
-                vertices[row.key] = row
-
-    records = []
-    for row in cell_rows:
-        sidecar = None
-        count = None
-        if None in row.key:
-            status = "invalid_cell_key"
-        else:
-            sidecar = vertices.get(row.key)
-            if sidecar is None:
-                counts["unmatched_cell_events"] += 1
-                status = "unmatched"
-            else:
-                counts["key_matched_events"] += 1
-                count = valid_count(sidecar.value)
-                if count is None:
-                    counts["matched_invalid_vertex_count"] += 1
-                    status = "invalid_vertex_count"
-                else:
-                    counts["matched_valid_vertex_count"] += 1
-                    counts["matched_zero_vertex_count"] += count == 0
-                    status = "matched"
-        records.append((
-            row.file, row.entry, *row.key, count, status,
-            sidecar.file if sidecar else None, sidecar.entry if sidecar else None,
-        ))
+    if vertex_event_int32_bits:
+        counts.update({"reinterpreted_negative_vertex_event_rows": 0, "matched_reinterpreted_negative_vertex_event_rows": 0})
+    vertices, vertex_trees, vertex_branch = _index_vertices(
+        vertex_files, vertex_dir, vertex_keys, vertex_tree, vertex_branch, target_keys, counts, signed_event_column,
+    )
+    records = _join_events(cell_rows, vertices, counts)
 
     if not matched_only:
         vertex_only = vertices.keys() - cells.keys()
@@ -308,6 +338,8 @@ def match(
             unique_matched_vertex_event_keys=len(vertices),
             vertex_duplicate_check_scope="matched_cell_keys",
         )
+    if vertex_event_int32_bits:
+        report["vertex_event_encoding"] = "signed int32 bit pattern interpreted as uint32; full cell key unchanged"
     return report, records
 
 
@@ -343,6 +375,8 @@ def main(argv=None):
         "--matched-only", action="store_true",
         help="Scan all vertex rows but retain and deduplicate only keys present in the cell files",
     )
+    parser.add_argument("--vertex-event-int32-bits", action="store_true",
+                        help="Interpret the sidecar's signed int32 eventNumber bits as unsigned; keep cell IDs exact")
     parser.add_argument("--output-dir", type=Path, help="Save summary.json and event_mapping.csv.gz")
     args = parser.parse_args(argv)
     try:
@@ -350,6 +384,7 @@ def main(argv=None):
             args.cell_dir, args.vertex_dir, key_fields=args.key_branches,
             vertex_keys=args.vertex_key_branches, vertex_branch=args.vertex_branch,
             cell_tree=args.cell_tree, vertex_tree=args.vertex_tree, matched_only=args.matched_only,
+            vertex_event_int32_bits=args.vertex_event_int32_bits,
         )
         if args.output_dir:
             write_outputs(args.output_dir, report, records)

@@ -25,8 +25,9 @@ from xgboost import XGBClassifier
 from xgboost.callback import EarlyStopping
 
 from xgb_data import (PHYSICS_FEATURES, KINEMATIC_FEATURES, prepare_training_data,
-                      physical_invalid_mask, sanitize_values)
-from xgb_evaluation import choose_threshold, evaluate_scores, make_plots
+                      physical_invalid_mask, sanitize_values, tile_fraction_mask)
+from xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores, make_plots
+from xgb_matching import _bin_indices, match_kinematics
 
 
 MODEL_FEATURES = {
@@ -61,6 +62,32 @@ def predict_model(model, frame, features):
     return model.predict_proba(frame[list(features)])[:, 1].astype(np.float64)
 
 
+def fit_booster(train, val, features, parameters, rounds, train_weights, val_weights, *, include_train_eval=False):
+    """Fit with early stopping on validation; optionally record the training history."""
+    features = list(features)
+    train_xy = train[features], train["label"]
+    eval_set = [(val[features], val["label"])]
+    eval_weights = [val_weights]
+    if include_train_eval:
+        eval_set.insert(0, train_xy)
+        eval_weights.insert(0, train_weights)
+    model = XGBClassifier(**parameters, callbacks=[EarlyStopping(
+        rounds=rounds, metric_name="logloss", data_name=f"validation_{len(eval_set) - 1}", save_best=True,
+    )])
+    model.fit(*train_xy, sample_weight=train_weights, eval_set=eval_set,
+              sample_weight_eval_set=eval_weights, verbose=False)
+    return model
+
+
+def _save_and_verify_model(model, path, frame, features, expected_scores, error):
+    """Ensure the saved booster reproduces the validation predictions exactly."""
+    model.save_model(path)
+    reloaded = XGBClassifier()
+    reloaded.load_model(path)
+    if not np.array_equal(expected_scores, predict_model(reloaded, frame, features)):
+        raise AssertionError(error)
+
+
 def score_saved_model(frame, output_dir):
     """Score selected, flattened jet rows with the saved main model.
 
@@ -87,8 +114,7 @@ def score_saved_model(frame, output_dir):
         & x["jet_eta"].abs().lt(sel["max_abs_eta"])
         & np.isfinite(x["jet_eta"])
         & np.isfinite(x["jet_time_ATLAS"])
-        & x["jet_TileEnergyFrac"].gt(0)
-        & x["jet_TileEnergyFrac"].lt(1)
+        & tile_fraction_mask(x["jet_TileEnergyFrac"], require_mixed=True)
     )
     support = spec.get("kinematic_support")
     if support:
@@ -96,11 +122,11 @@ def score_saved_model(frame, output_dir):
         eta_edges = np.asarray(support["abs_eta_edges"])
         pt = x["jet_pt_GeV"].to_numpy()
         eta = x["jet_eta"].abs().to_numpy()
-        pt_bin = np.minimum(np.searchsorted(pt_edges, pt, side="right") - 1, len(pt_edges) - 2)
-        eta_bin = np.minimum(np.searchsorted(eta_edges, eta, side="right") - 1, len(eta_edges) - 2)
+        pt_bin = _bin_indices(pt, pt_edges)
+        eta_bin = _bin_indices(eta, eta_edges)
         bins = {(b["pt_bin"], b["eta_bin"]) for b in support["supported_bins"]}
         supported = np.array([(p, e) in bins for p, e in zip(pt_bin, eta_bin)], dtype=bool)
-        valid &= (pt >= pt_edges[0]) & (pt <= pt_edges[-1]) & (eta >= eta_edges[0]) & (eta <= eta_edges[-1]) & supported
+        valid &= (pt_bin >= 0) & (eta_bin >= 0) & supported
     model = XGBClassifier()
     model.load_model(output_dir / "xgboost.ubj")
     scores = np.full(len(x), np.nan)
@@ -115,7 +141,7 @@ def score_saved_model(frame, output_dir):
 def _subset_report(frame, scores, threshold, seed):
     """Fixed diagnostic regions; never use these test results to select a cut."""
     regions = {
-        "delayed_time_gt_3ns": frame["jet_time_ATLAS"].gt(3).to_numpy(),
+        "delayed_time_gt_3ns": frame["jet_time_ATLAS"].gt(DELAYED_TIME_NS).to_numpy(),
         "pt_30_to_100_GeV": frame["jet_pt_GeV"].lt(100).to_numpy(),
         "pt_100_to_300_GeV": (frame["jet_pt_GeV"].ge(100) & frame["jet_pt_GeV"].lt(300)).to_numpy(),
         "pt_ge_300_GeV": frame["jet_pt_GeV"].ge(300).to_numpy(),
@@ -221,7 +247,6 @@ def _matched_check(frame, params, output_dir, *, seed, target, selection):
     between splits. It changes the evaluated population, so its rates are
     reported separately rather than as replacements for the original test.
     """
-    from xgb_matching import match_kinematics
     output_dir.mkdir(parents=True, exist_ok=True)
     matched, audit = match_kinematics(frame, seed=seed)
     matched.to_csv(output_dir / "matched_jets.csv.gz", index=False)
@@ -251,22 +276,16 @@ def _matched_check(frame, params, output_dir, *, seed, target, selection):
     plt.close(fig)
     print(f"Kinematic check: {len(train):,} train, {len(validation):,} validation, {len(test):,} test jets.", flush=True)
     metrics, scores, thresholds, histories, gain_rows = {}, {}, {}, {}, []
+    train_w = balanced_weights(train.label, train.label)
+    validation_w = balanced_weights(validation.label, train.label)
     for name, features in MODEL_FEATURES.items():
-        model = XGBClassifier(**params, callbacks=[EarlyStopping(
-            rounds=40, metric_name="logloss", data_name="validation_1", save_best=True)])
-        model.fit(train[features], train.label,
-                  sample_weight=balanced_weights(train.label, train.label),
-                  eval_set=[(train[features], train.label), (validation[features], validation.label)],
-                  sample_weight_eval_set=[balanced_weights(train.label, train.label),
-                                          balanced_weights(validation.label, train.label)], verbose=False)
+        model = fit_booster(train, validation, features, params, 40, train_w, validation_w,
+                            include_train_eval=True)
         val_scores = predict_model(model, validation, features)
         threshold = choose_threshold(validation.label, val_scores, target)
         slug = name.lower().replace(" ", "_")
-        model.save_model(output_dir / f"{slug}.ubj")
-        reloaded = XGBClassifier()
-        reloaded.load_model(output_dir / f"{slug}.ubj")
-        if not np.array_equal(val_scores, predict_model(reloaded, validation, features)):
-            raise AssertionError("Matched-check model changed on save/reload.")
+        _save_and_verify_model(model, output_dir / f"{slug}.ubj", validation, features, val_scores,
+                               "Matched-check model changed on save/reload.")
         # Cut and tree count are frozen before scoring this check's test subset.
         score = predict_model(model, test, features)
         scores[name], thresholds[name], histories[name] = score, threshold, model.evals_result()
@@ -337,22 +356,16 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
     # matching study are exploratory follow-ups to the initial three models.
     for name, features in MODEL_FEATURES.items():
         print(f"Training {name}: {', '.join(features)}", flush=True)
-        model = XGBClassifier(**params, callbacks=[EarlyStopping(
-            rounds=40, metric_name="logloss", data_name="validation_1", save_best=True)])
-        model.fit(train[features], train.label, sample_weight=train_w,
-                  eval_set=[(train[features], train.label), (validation[features], validation.label)],
-                  sample_weight_eval_set=[train_w, validation_w], verbose=False)
+        model = fit_booster(train, validation, features, params, 40, train_w, validation_w,
+                            include_train_eval=True)
         val_scores = predict_model(model, validation, features)
         threshold = choose_threshold(validation.label, val_scores, target_llp_keep)
         models[name] = model
         histories[name] = model.evals_result()
         thresholds[name] = threshold
         slug = slugs[name]
-        model.save_model(output_dir / f"{slug}.ubj")
-        reloaded = XGBClassifier()
-        reloaded.load_model(output_dir / f"{slug}.ubj")
-        if not np.array_equal(val_scores, predict_model(reloaded, validation, features)):
-            raise AssertionError("Saved model predictions differ after loading.")
+        _save_and_verify_model(model, output_dir / f"{slug}.ubj", validation, features, val_scores,
+                               "Saved model predictions differ after loading.")
         metrics[name] = {
             "features": features, "best_iteration_zero_based": int(model.best_iteration),
             "saved_trees": int(model.get_booster().num_boosted_rounds()),

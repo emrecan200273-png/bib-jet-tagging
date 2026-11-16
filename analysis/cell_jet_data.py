@@ -13,10 +13,11 @@ CELL_FEATURES = (
     "cell_dEta_jet", "cell_dPhi_jet",
 )
 CELL_BRANCHES = ("cell_e", "cell_time", "cell_x", "cell_y", "cell_z", "cell_dEta_jet", "cell_dPhi_jet")
-BRANCHES = (
+JET_CELL_KEYS = (
     "runNumber", "eventNumber", "jet_pt", "jet_eta", "jet_n_clusters",
-    "cluster_n_cells", *CELL_BRANCHES,
+    "cluster_n_cells",
 )
+BRANCHES = (*JET_CELL_KEYS, *CELL_BRANCHES)
 REQUIRED_COLUMNS = (
     "source_file", "row_index", "jet_index", "event_group", "split", "label", "jet_eta",
 )
@@ -49,12 +50,16 @@ def _source_path(data_root, relative):
     return source
 
 
-def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept):
-    """Associate cells by the producer's jet -> cluster -> cell traversal order."""
-    rows, event_index = np.unique(subset["row_index"].to_numpy(), return_inverse=True)
+def _read_rows(tree, fields, rows, relative):
+    """Read the sorted unique indices from one bounded range."""
     start, stop = int(rows[0]), int(rows[-1]) + 1
-    context = f"{relative}, rows {start}–{stop - 1}"
-    arrays = tree.arrays(BRANCHES, entry_start=start, entry_stop=stop, library="ak")[rows - start]
+    if start < 0 or stop > tree.num_entries:
+        raise ValueError(f"Saved row_index is outside JetContent in {relative}")
+    arrays = tree.arrays(fields, entry_start=start, entry_stop=stop, library="ak")[rows - start]
+    return arrays, f"{relative}, rows {start}–{stop - 1}"
+
+
+def _verify_event_keys(arrays, subset, event_index, context):
     run = _int_vector(ak.to_numpy(arrays["runNumber"], allow_missing=False), "runNumber", context)
     event = _int_vector(ak.to_numpy(arrays["eventNumber"], allow_missing=False), "eventNumber", context)
     event_ids = [f"{int(r)}:{int(e)}" for r, e in zip(run, event, strict=True)]
@@ -62,13 +67,17 @@ def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid
     if not np.array_equal(subset["event_group"].to_numpy(), expected_ids):
         raise ValueError(f"Saved run/event identity disagrees with the ROOT row: {context}")
 
-    event_n_jets = ak.to_numpy(ak.num(arrays["jet_pt"], axis=1), allow_missing=False)
-    event_n_clusters = ak.to_numpy(ak.num(arrays["cluster_n_cells"], axis=1), allow_missing=False)
-    event_n_cells = ak.to_numpy(ak.num(arrays["cell_e"], axis=1), allow_missing=False)
-    for fields, expected in ((["jet_eta", "jet_n_clusters"], event_n_jets), (CELL_BRANCHES, event_n_cells)):
+
+def _jet_cell_offsets(arrays, cell_fields, context):
+    def lengths(field):
+        return ak.to_numpy(ak.num(arrays[field], axis=1), allow_missing=False)
+
+    event_n_jets = lengths("jet_pt")
+    event_n_clusters = lengths("cluster_n_cells")
+    event_n_cells = lengths(cell_fields[0])
+    for fields, expected in ((("jet_eta", "jet_n_clusters"), event_n_jets), (cell_fields, event_n_cells)):
         for field in fields:
-            lengths = ak.to_numpy(ak.num(arrays[field], axis=1), allow_missing=False)
-            if not np.array_equal(lengths, expected):
+            if not np.array_equal(lengths(field), expected):
                 raise ValueError(f"Unaligned {field} vectors: {context}")
 
     jet_n_clusters = _int_vector(_flatten(arrays["jet_n_clusters"]), "jet_n_clusters", context)
@@ -81,12 +90,14 @@ def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid
         raise ValueError(f"sum(jet_n_clusters) does not match the cluster count: {context}")
     if not np.array_equal(cluster_cell_offsets[event_cluster_offsets], _offsets(event_n_cells)):
         raise ValueError(f"sum(cluster_n_cells) does not match the cell count: {context}")
-    jet_cell_offsets = cluster_cell_offsets[jet_cluster_offsets]
+    return event_n_jets, event_jet_offsets, cluster_cell_offsets[jet_cluster_offsets]
 
-    jet_indices = subset["jet_index"].to_numpy()
+
+def _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context):
+    jet_indices = _int_vector(subset["jet_index"].to_numpy(), "jet_index", context)
     if np.any(jet_indices >= event_n_jets[event_index]):
         raise ValueError(f"Saved jet_index is outside the ROOT jet vector: {context}")
-    jet_indices = event_jet_offsets[event_index] + jet_indices
+    jet_indices = event_jet_offsets[event_index] + jet_indices.astype(np.int64, copy=False)
     comparisons = [("jet_eta", "jet_eta", 1.0)]
     if "jet_pt_GeV" in subset.columns:
         comparisons.append(("jet_pt_GeV", "jet_pt", 0.001))
@@ -95,10 +106,23 @@ def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid
         if (not np.isfinite(root_values).all() or np.any(root_values == INVALID_CELL * scale)
                 or not np.allclose(subset[saved].to_numpy(dtype=float), root_values, rtol=1e-9, atol=1e-8)):
             raise ValueError(f"Saved {saved} disagrees with the ROOT jet at jet_index: {context}")
+    return jet_indices
 
-    flat_cells = np.column_stack([_flatten(arrays[field]) for field in CELL_BRANCHES])
-    for i, jet in zip(subset.index, jet_indices, strict=True):
-        lo, hi = jet_cell_offsets[jet:jet + 2]
+
+def read_jet_cell_spans(tree, subset, relative, *, cell_fields=CELL_BRANCHES):
+    """Return flat cell fields and aligned [start, stop) spans for one chunk."""
+    rows, event_index = np.unique(subset["row_index"].to_numpy(), return_inverse=True)
+    arrays, context = _read_rows(tree, (*JET_CELL_KEYS, *cell_fields), rows, relative)
+    _verify_event_keys(arrays, subset, event_index, context)
+    event_n_jets, event_jet_offsets, offsets = _jet_cell_offsets(arrays, cell_fields, context)
+    jets = _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context)
+    fields = np.column_stack([_flatten(arrays[field]) for field in cell_fields])
+    return fields, np.column_stack((offsets[jets], offsets[jets + 1]))
+
+
+def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid, energy_kept):
+    flat_cells, spans = read_jet_cell_spans(tree, subset, relative)
+    for i, (lo, hi) in zip(subset.index, spans, strict=True):
         row = flat_cells[lo:hi]
         stored[i] = len(row)
         keep = np.isfinite(row).all(axis=1) & (row != INVALID_CELL).all(axis=1) & (row[:, 0] > 0)
@@ -110,14 +134,14 @@ def _read_chunk(tree, subset, relative, max_cells, store_features, stored, valid
         energies = row[:, 0].astype(np.float64, copy=False)
         total_energy = energies.sum()
         if not np.isfinite(total_energy):
-            raise ValueError(f"Nonfinite energy sum for jet {jet}: {context}")
+            raise ValueError(f"Nonfinite energy sum for jet table row {i}: {relative}")
         top = np.argsort(-energies, kind="stable")[:max_cells]
         e, t, x, y, z, d_eta, d_phi = row[top].T
         e_fraction = e / total_energy
         features = np.column_stack((t, np.log1p(100.0 * e_fraction), np.hypot(x, y) / 1000.0,
                                     z / 1000.0, d_eta, d_phi)).astype(np.float32)
         if not np.isfinite(features).all():
-            raise ValueError(f"Nonfinite cell features for jet {jet}: {context}")
+            raise ValueError(f"Nonfinite cell features for jet table row {i}: {relative}")
         store_features(i, features)
         energy_kept[i] = e_fraction.sum()
 
@@ -173,8 +197,7 @@ def extract_cells(jets, data_root, max_cells):
         mask[i, :n] = True
 
     if max_cells is None:
-        # Store only the actual cells until the required padding width is known.
-        # This avoids reading the ROOT files twice to size the dense result.
+        # Discover the padding width without rereading the ROOT files.
         ragged = [None] * len(frame)
         store_features = ragged.__setitem__
     else:

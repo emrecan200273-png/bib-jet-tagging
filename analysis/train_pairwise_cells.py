@@ -1,7 +1,6 @@
 """Train and compare uncapped neural models on the same calorimeter-cell data."""
 
 import argparse
-import hashlib
 from importlib.metadata import version
 import json
 from pathlib import Path
@@ -9,11 +8,10 @@ from pathlib import Path
 import train_cell_models as pilot
 from cell_generalization import plot_learning_curves, summarize_generalization
 from cell_jet_data import CELL_FEATURES, extract_cells
-from cell_models import build_model
+from cell_models import restore_model
 from data_paths import resolve_data_paths
 from train_xgboost import write_json
 from train_xgboost_vertex import kinematic_comparison, load_jets, make_comparison_plot, paired_interval, population
-from xgb_evaluation import choose_threshold
 import numpy as np
 import pandas as pd
 import torch
@@ -26,16 +24,10 @@ DEEP = "deep_cell_transformer"
 BIB = "bib_cell_transformer"
 DISPLAY_NAMES = {REFERENCE: "Transformer", PAIRWISE: "ParT-inspired", PARTICLE_NET: "ParticleNet-Lite",
                  DEEP: "Two-block Transformer", BIB: "Two-block Transformer + BIB profile"}
-IDENTITY = ["event_group", "source_file", "row_index", "jet_index"]
 PARTICLE_NET_BATCH_CELLS = 8192
 
 
-def fingerprint(path):
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def run_comparison(project_root, threads, architecture):
+def run_comparison(project_root, threads, architecture, output_override=None):
     root = Path(project_root).resolve()
     outputs = root / "analysis/outputs"
     graph = architecture == PARTICLE_NET
@@ -52,30 +44,34 @@ def run_comparison(project_root, threads, architecture):
         references, trained = (REFERENCE,), (PAIRWISE,)
         previous_dir = outputs / "cell_model_full_comparison"
         output_dir = outputs / "pairwise_cell_comparison"
+    if output_override is not None:
+        output_dir = Path(output_override).resolve()
     names = {name: DISPLAY_NAMES[name] for name in (*references, *trained)}
     previous_report = previous_dir / "metrics.json"
     previous_predictions = previous_dir / "test_predictions.csv.gz"
     jet_table = outputs / "xgboost_baseline/training_jets.csv.gz"
     vertex_map = outputs / "unpaired_vertex_match/event_mapping.csv.gz"
     data_root, manifest = resolve_data_paths(root)
+    if output_dir.is_relative_to(data_root.resolve()) or output_dir.is_relative_to(previous_dir):
+        raise ValueError("Write the comparison outside the input data and reference outputs")
     previous = json.loads(previous_report.read_text())
     settings = previous["settings"]
     if settings["max_cells"] is not None or previous["cell_features"] != list(CELL_FEATURES):
         raise ValueError("Expected a saved uncapped comparison with matching cell inputs")
     seed, target = settings["seed"], previous["target_llp_keep_on_validation"]
     batch_size = settings["batch_size"]
-    hashes = {str(path): fingerprint(path) for path in
-              (jet_table, vertex_map, manifest, previous_report, previous_predictions)}
+    hashes = pilot.input_hashes((jet_table, vertex_map, manifest, previous_report, previous_predictions))
     for path in (jet_table, vertex_map, manifest):
         if hashes[str(path)] != previous["inputs_sha256"].get(str(path.resolve())):
             raise ValueError(f"Input differs from the saved comparison: {path}")
 
     _, jets = load_jets(jet_table, vertex_map)
     jets = jets.reset_index(drop=True)
-    indices = {split: torch.from_numpy(np.flatnonzero(jets["split"].eq(split))) for split in pilot.SPLITS}
+    indices = pilot.split_indices(jets)
     val_frame, test_frame = (jets.iloc[indices[split].numpy()] for split in ("validation", "test"))
     reference_test = pd.read_csv(previous_predictions)
-    if not test_frame[IDENTITY].reset_index(drop=True).equals(reference_test[IDENTITY]):
+    identity = pilot.JET_IDENTITY
+    if not test_frame[identity].reset_index(drop=True).equals(reference_test[identity]):
         raise ValueError("The test jets differ from the saved comparison")
     if not test_frame["label"].reset_index(drop=True).equals(reference_test["label"]):
         raise ValueError("The test labels differ from the saved comparison")
@@ -97,11 +93,12 @@ def run_comparison(project_root, threads, architecture):
 
     if deep:
         model_options = {key: scaling[key] for key in ("cell_center", "cell_scale")}
+    elif graph:
+        model_options = {"angular_scale": scaling["cell_scale"][4:6]}
     else:
-        model_options = {"angular_scale": scaling["cell_scale"][4:6]} if graph else {}
+        model_options = {}
     max_batch_cells = PARTICLE_NET_BATCH_CELLS if graph else None
     test_scores = {name: reference_test[f"{name}_score"].to_numpy() for name in references}
-    delayed_val = val_frame["jet_time_ATLAS"].gt(pilot.DELAYED_TIME_NS).to_numpy()
     cuts = {name: previous["thresholds_from_all_validation_jets"][name] for name in references}
     delayed_cuts = {name: previous["thresholds_from_delayed_validation_jets"][name] for name in references}
     for name in references:
@@ -120,13 +117,11 @@ def run_comparison(project_root, threads, architecture):
         model_path = output_dir / (f"{name}.pt" if deep else "neural_model.pt")
         saved = {"architecture": name, "model_options": model_options, "state_dict": model.state_dict(),
                  "jet_features": jet_features, "cell_features": list(CELL_FEATURES), "scaling": scaling, "max_cells": None}
-        torch.save(saved, model_path)
         logits = {split: pilot.predict_logits(model, inputs, index, batch_size, lengths, max_batch_cells)
                   for split, index in indices.items()}
         validation_scores = logits["validation"].sigmoid().numpy().astype(np.float64)
         test_scores[name] = logits["test"].sigmoid().numpy().astype(np.float64)
-        cuts[name] = choose_threshold(val_frame["label"], validation_scores, target)
-        delayed_cuts[name] = choose_threshold(val_frame.loc[delayed_val, "label"], validation_scores[delayed_val], target)
+        cuts[name], delayed_cuts[name] = pilot.validation_cuts(val_frame, validation_scores, target)
         histories[name] = history
         generalization[name] = summarize_generalization(
             split_labels, {split: values.numpy() for split, values in logits.items()}, split_labels["train"],
@@ -135,22 +130,18 @@ def run_comparison(project_root, threads, architecture):
         saved.update(threshold=cuts[name], delayed_threshold=delayed_cuts[name])
         torch.save(saved, model_path)
         loaded = torch.load(model_path, weights_only=True)
-        restored = build_model(loaded["architecture"], *model_dims, **loaded["model_options"])
-        restored.load_state_dict(loaded["state_dict"])
+        restored = restore_model(loaded["architecture"], *model_dims, loaded["state_dict"], **loaded["model_options"])
         restored_scores = pilot.predict_logits(restored, inputs, indices["test"], batch_size, lengths, max_batch_cells).sigmoid().numpy()
         if not np.array_equal(restored_scores, test_scores[name]):
             raise AssertionError(f"Reloaded model predictions differ for {name}")
 
     comparisons, results = pilot.compare_test_scores(test_frame, test_scores, cuts, delayed_cuts, seed)
-    delayed_test = test_frame["jet_time_ATLAS"].gt(pilot.DELAYED_TIME_NS).to_numpy()
+    pairs = [(reference, name) for reference in references for name in trained]
+    if deep:
+        pairs.append((DEEP, BIB))
     paired = {}
-    for region, subset, thresholds in [("all", np.ones(len(test_frame), dtype=bool), cuts),
-                                       ("delayed", delayed_test, cuts),
-                                       ("delayed_at_delayed_validation_target", delayed_test, delayed_cuts)]:
+    for region, subset, thresholds in pilot.evaluation_regions(test_frame, cuts, delayed_cuts):
         scores = {name: score[subset] for name, score in test_scores.items()}
-        pairs = [(reference, name) for reference in references for name in trained]
-        if deep:
-            pairs.append((DEEP, BIB))
         differences = {(reference, name): {metric: paired_interval(
             test_frame.loc[subset], scores, thresholds, label, seed, model_names=(reference, name),
         ) for label, metric in [(0, "llp_kept"), (1, "unpaired_tagged")]} for reference, name in pairs}
@@ -160,7 +151,7 @@ def run_comparison(project_root, threads, architecture):
             paired[region] = {reference: differences[(reference, PARTICLE_NET)] for reference in references}
         else:
             paired[region] = differences[(REFERENCE, PAIRWISE)]
-    fields = [*IDENTITY, "sample", "label", "vertex_count", "jet_time_ATLAS", "jet_pt_GeV", "jet_abs_eta"]
+    fields = [*identity, "sample", "label", "vertex_count", "jet_time_ATLAS", "jet_pt_GeV", "jet_abs_eta"]
     predictions = test_frame[fields].copy()
     for name, score in test_scores.items():
         predictions[f"{name}_score"] = score
@@ -192,6 +183,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--output-dir", type=Path, help="Write this run to a separate output folder")
     models = parser.add_mutually_exclusive_group()
     models.add_argument("--particle-net-lite", action="store_true", help="Train ParticleNet-Lite and include both saved Transformers")
     models.add_argument("--deep-transformers", action="store_true", help="Compare two-block Transformers with and without the BIB profile")
@@ -199,4 +191,4 @@ if __name__ == "__main__":
     if args.threads < 1:
         parser.error("Threads must be positive")
     architecture = DEEP if args.deep_transformers else PARTICLE_NET if args.particle_net_lite else PAIRWISE
-    print(run_comparison(args.project_root, args.threads, architecture).to_string(index=False))
+    print(run_comparison(args.project_root, args.threads, architecture, args.output_dir).to_string(index=False))

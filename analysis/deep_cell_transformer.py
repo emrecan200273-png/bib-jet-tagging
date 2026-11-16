@@ -10,6 +10,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from cell_models import attention_key_mask, jet_classifier
+
 
 WIDTH = 32
 HEADS = 4
@@ -98,10 +100,7 @@ class DeepCellTransformer(nn.Module):
         self.readout_norm = nn.LayerNorm(WIDTH)
         self.readout_kv = nn.Linear(WIDTH, 2 * WIDTH)
         self.readout_output = nn.Linear(WIDTH, WIDTH)
-        self.classifier = nn.Sequential(
-            nn.Linear(jet_dim + WIDTH, 64), nn.SiLU(), nn.Dropout(DROP),
-            nn.Linear(64, 32), nn.SiLU(), nn.Dropout(DROP), nn.Linear(32, 1),
-        )
+        self.classifier = jet_classifier(jet_dim + WIDTH, DROP)
 
     def _geometry(self, cells, valid):
         base = cells[..., (0, 2, 3, 4, 5)]
@@ -136,10 +135,7 @@ class DeepCellTransformer(nn.Module):
         else:
             valid = mask.bool()
             cells = cells.masked_fill(~valid.unsqueeze(-1), 0)
-            empty = ~valid.any(dim=1, keepdim=True)
-            first = torch.arange(count, device=valid.device).eq(0).unsqueeze(0)
-            # Only an empty row gets a temporary key. Its readout is zeroed.
-            valid_keys = valid | (empty & first)
+            valid_keys, empty = attention_key_mask(valid)
             coordinates = self._geometry(cells, valid)
             encoded = self.cell_projection(cells)
             for block in self.blocks:

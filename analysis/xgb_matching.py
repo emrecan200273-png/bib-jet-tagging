@@ -12,6 +12,7 @@ ABS_ETA_EDGES = np.linspace(0., 1.7, 10)
 SPLITS = ("train", "validation", "test")
 MIN_TRAIN_JETS_PER_CLASS_PER_BIN = 3
 MIN_HELD_OUT_JETS_PER_CLASS = 200
+BIN_COLUMNS = ["pt_bin", "eta_bin"]
 
 
 def _bin_indices(values, edges):
@@ -23,6 +24,35 @@ def _bin_indices(values, edges):
         np.searchsorted(edges, values[valid], side="right") - 1, len(edges) - 2,
     )
     return bins
+
+
+def add_kinematic_bins(frame):
+    """Return a copy with the fixed pT and |eta| bin IDs; -1 is out of range."""
+    return frame.assign(
+        pt_bin=_bin_indices(frame["jet_pt_GeV"], PT_EDGES_GEV),
+        eta_bin=_bin_indices(frame["jet_abs_eta"], ABS_ETA_EDGES),
+    )
+
+
+def supported_kinematic_bins(binned_train):
+    """Find bins with enough jets of both classes in the training split."""
+    in_range = binned_train[BIN_COLUMNS].ge(0).all(axis=1)
+    counts = (binned_train.loc[in_range].groupby([*BIN_COLUMNS, "label"], observed=True).size()
+              .unstack("label", fill_value=0).reindex(columns=[0, 1], fill_value=0))
+    supported = counts.min(axis=1).ge(MIN_TRAIN_JETS_PER_CLASS_PER_BIN)
+    return {(int(pt), int(eta)) for pt, eta in counts.index[supported]}
+
+
+def overlap_weights(frame, support):
+    """Match the two class totals within each supported bin, without subsampling."""
+    weights = np.zeros(len(frame))
+    for key, group in frame.reset_index(drop=True).groupby(BIN_COLUMNS, sort=False):
+        if key not in support:
+            continue
+        counts = group["label"].value_counts()
+        if len(counts) == 2:
+            weights[group.index] = counts.min() / group["label"].map(counts)
+    return weights
 
 
 def match_kinematics(frame, *, seed=42):
@@ -60,20 +90,9 @@ def match_kinematics(frame, *, seed=42):
     sort_keys = ["event_group", "jet_index", "source_file"]
     if "row_index" in frame.columns:
         sort_keys.append("row_index")
-    work = frame.sort_values(sort_keys, kind="stable").reset_index(drop=True).copy()
-    work["pt_bin"] = _bin_indices(work["jet_pt_GeV"], PT_EDGES_GEV)
-    work["eta_bin"] = _bin_indices(work["jet_abs_eta"], ABS_ETA_EDGES)
+    work = add_kinematic_bins(frame.sort_values(sort_keys, kind="stable").reset_index(drop=True))
     in_range = work["pt_bin"].ge(0) & work["eta_bin"].ge(0)
-    training = work.loc[in_range & work["split"].eq("train")]
-    training_counts = (
-        training.groupby(["pt_bin", "eta_bin", "label"], observed=True).size()
-        .unstack("label", fill_value=0).reindex(columns=[0, 1], fill_value=0)
-    )
-    supported = {
-        (int(pt), int(eta))
-        for (pt, eta), counts in training_counts.iterrows()
-        if counts.min() >= MIN_TRAIN_JETS_PER_CLASS_PER_BIN
-    }
+    supported = supported_kinematic_bins(work.loc[work["split"].eq("train")])
     if not supported:
         raise ValueError("No training bin contains at least three jets of each class")
     work_bins = list(zip(work["pt_bin"], work["eta_bin"]))

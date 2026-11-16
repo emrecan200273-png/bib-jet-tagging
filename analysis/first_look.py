@@ -1,8 +1,4 @@
-"""Read a bounded, reproducible pilot of the two prepared JetContent samples.
-
-Source ROOT files are read only. A row is kept separate from the jets and cells
-it stores: no cell-to-jet mapping, physical class labels or training is inferred.
-"""
+"""Read a small, fixed sample of jets and cells from the ROOT files."""
 from collections import Counter
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -30,6 +26,7 @@ JET_FIELDS = ["jet_e", "jet_pt", "jet_eta", "jet_phi", "jet_time_ATLAS",
 CELL_FIELDS = ["cell_x", "cell_y", "cell_z", "cell_e", "cell_time",
                "cell_time_sigma", "cell_quality"]
 CLUSTER_FIELDS = ["cluster_e", "cluster_n_cells"]
+VECTOR_FIELDS = JET_FIELDS + CLUSTER_FIELDS + CELL_FIELDS
 CANDIDATE_FEATURES = ["jet_pt", "jet_eta", "jet_time_ATLAS", "jet_time_spread",
                       "jet_time_sigma", "jet_n_clusters", "jet_TileEnergyFrac"]
 
@@ -39,11 +36,12 @@ def write_json(path, value):
 
 
 def source_inventory(project_root, output_dir):
-    """Read metadata for all 293 files, retaining exact source-manifest hashes."""
+    """Check file sizes and list the branches in the selected samples."""
     project_root, output_dir = Path(project_root), Path(output_dir)
     data_root, manifest_path = resolve_data_paths(project_root)
     manifest = json.loads(manifest_path.read_text())
     records = [r for r in manifest["files"] if str(Path(r["path"]).parent) in GROUPS]
+    required = set(IDS + VECTOR_FIELDS)
     inventory = []
     for record in records:
         relative = record["path"]
@@ -54,9 +52,9 @@ def source_inventory(project_root, output_dir):
         with uproot.open(path) as handle:
             tree = handle["JetContent"]
             names = sorted(tree.keys())
-            required = set(IDS + JET_FIELDS + CELL_FIELDS + CLUSTER_FIELDS)
-            if required - set(names):
-                raise ValueError(f"Missing required branches: {relative}: {required - set(names)}")
+            missing = required.difference(names)
+            if missing:
+                raise ValueError(f"Missing required branches in {relative}: {sorted(missing)}")
             inventory.append({
                 "group": str(Path(relative).parent), "relative_path": relative,
                 "file_size": stat.st_size, "local_mtime_ns": stat.st_mtime_ns,
@@ -95,7 +93,7 @@ def extract_pilot(project_root, inventory, output_dir):
     for file in sorted(inventory["files"], key=lambda f: (f["group"], f["relative_path"])):
         sample, per_file = GROUPS[file["group"]]
         relative = file["relative_path"]
-        wanted = IDS + JET_FIELDS + CLUSTER_FIELDS + CELL_FIELDS
+        wanted = IDS + VECTOR_FIELDS
         has_truth_match = "jet_is_llp_matched" in file["branch_names"]
         if has_truth_match:
             wanted = wanted + ["jet_is_llp_matched"]
@@ -107,7 +105,7 @@ def extract_pilot(project_root, inventory, output_dir):
         for index, record in enumerate(arrays):
             identity = {k: str(int(record[k])) for k in IDS}
             base = {"sample": sample, "source_file": relative, "row_index": index, **identity}
-            vectors = {k: np.asarray(ak.to_list(record[k])) for k in JET_FIELDS + CLUSTER_FIELDS + CELL_FIELDS}
+            vectors = {k: np.asarray(ak.to_list(record[k])) for k in VECTOR_FIELDS}
             njet = len(vectors["jet_pt"])
             ncluster = len(vectors["cluster_n_cells"])
             ncell = len(vectors["cell_time"])
@@ -121,11 +119,10 @@ def extract_pilot(project_root, inventory, output_dir):
                 raise ValueError(f"Unaligned vectors: {relative}, row {index}")
             jet_counts = vectors["jet_n_clusters"]
             cluster_counts = vectors["cluster_n_cells"]
-            count_values_ok = bool(np.all(np.isfinite(jet_counts)) and
-                                   np.all(np.isfinite(cluster_counts)) and
-                                   np.all(jet_counts >= 0) and np.all(cluster_counts >= 0) and
-                                   np.all(jet_counts == np.floor(jet_counts)) and
-                                   np.all(cluster_counts == np.floor(cluster_counts)))
+            count_values_ok = all(
+                np.all(np.isfinite(counts) & (counts >= 0) & (counts == np.floor(counts)))
+                for counts in (jet_counts, cluster_counts)
+            )
             sum_jet_clusters = int(jet_counts.sum()) if count_values_ok else None
             sum_cluster_cells = int(cluster_counts.sum()) if count_values_ok else None
             rows.append({**base, "jet_count": njet, "cluster_count": ncluster, "cell_count": ncell,
@@ -136,13 +133,10 @@ def extract_pilot(project_root, inventory, output_dir):
                          "cluster_cell_count_matches": sum_cluster_cells == ncell})
             for jet_index in range(njet):
                 jet = {**base, "jet_index": jet_index}
-                for field in JET_FIELDS:
-                    value = vectors[field][jet_index].item()
-                    jet[field] = value
-                # Diagnostic truth information is kept separate from candidate model inputs.
+                jet.update({field: vectors[field][jet_index].item() for field in JET_FIELDS})
                 jet["jet_is_llp_matched"] = int(matched[jet_index]) if has_truth_match else pd.NA
                 jets.append(jet)
-            # Timing-blind deterministic example: first row with any stored cells.
+            # Use the first row with cells, without looking at its timing.
             if sample not in example_sources and ncell:
                 example_sources.add(sample)
                 finite_pair = np.isfinite(vectors["cell_z"]) & np.isfinite(vectors["cell_time"])

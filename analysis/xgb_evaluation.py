@@ -20,6 +20,21 @@ from sklearn.metrics import (
 )
 
 
+DELAYED_TIME_NS = 3.0
+NEAR_DELAYED_MAX_NS = 10.0
+
+
+def jet_time_regions(frame):
+    """Return aligned masks for all jets, delayed jets, and the 3–10 ns region."""
+    time = frame["jet_time_ATLAS"]
+    delayed = time.gt(DELAYED_TIME_NS).to_numpy(dtype=bool, na_value=False)
+    return {
+        "all": np.ones(len(frame), dtype=bool),
+        "delayed": delayed,
+        "3_to_10_ns": delayed & time.le(NEAR_DELAYED_MAX_NS).to_numpy(dtype=bool, na_value=False),
+    }
+
+
 def _inputs(y, scores):
     y = np.asarray(y)
     scores = np.asarray(scores, dtype=float)
@@ -56,6 +71,36 @@ def choose_threshold(y, scores, target_llp_keep=0.95):
     if not np.isfinite(threshold):
         raise ValueError("The LLP scores are too large to form a finite threshold.")
     return threshold
+
+
+def weighted_cut(frame, scores, weights, target):
+    """Choose a validation cut by retained LLP weight instead of jet count."""
+    signal = frame["label"].eq(0).to_numpy() & (weights > 0)
+    if not signal.any():
+        raise ValueError("Common kinematic validation needs LLP jets")
+    values, mass = scores[signal], weights[signal]
+    ordered = np.argsort(values)
+    cumulative = np.cumsum(mass[ordered])
+    edge = np.searchsorted(cumulative, target * cumulative[-1])
+    return float(np.nextafter(values[ordered[edge]], np.inf))
+
+
+def rates(frame, scores, threshold, weights=None):
+    """Summarize cuts and AUC on finite scores, with optional kinematic weights."""
+    weights = np.ones(len(frame)) if weights is None else weights
+    keep = (weights > 0) & np.isfinite(scores)
+    labels, scores, weights = frame["label"].to_numpy()[keep], scores[keep], weights[keep]
+    tagged = scores >= threshold
+    result = {"auc": (float(roc_auc_score(labels, scores, sample_weight=weights))
+                      if len(np.unique(labels)) == 2 else None)}
+    for key, label, success in [("llp_kept", 0, ~tagged), ("unpaired_tagged", 1, tagged)]:
+        selected = labels == label
+        result[key] = {
+            "total": int(selected.sum()),
+            "count": int(success[selected].sum()),
+            "rate": float(np.average(success[selected], weights=weights[selected])) if selected.any() else None,
+        }
+    return result
 
 
 def _event_bootstrap(y, tagged, groups, repeats, seed):
