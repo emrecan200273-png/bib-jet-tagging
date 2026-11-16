@@ -3,10 +3,32 @@
 This project tests whether machine learning can tag beam-induced background
 (BIB) in ATLAS jets while keeping jets from long-lived particles (LLPs).
 
-- [Notebook 1](analysis/01_remote_data_inventory.ipynb) checks the input files.
-- [Notebook 2](analysis/02_first_data_look.ipynb) plots a small sample.
-- [Notebook 3](analysis/03_xgboost_baseline.ipynb) shows the XGBoost baseline.
-- The [analysis guide](analysis/README.md) covers the cell models and checks.
+## Where to start
+
+| Step | Code | What it does |
+| --- | --- | --- |
+| Select the jets | [xgb_data.py](analysis/xgb_data.py) | Selects LLP and unpaired jets and splits whole events into train, validation and test. |
+| Match the vertex counts | [match_unpaired_vertices.py](analysis/match_unpaired_vertices.py) | Joins the separate vertex ntuple to the cell ntuple by run, event and luminosity block. |
+| Read the cells | [cell_jet_data.py](analysis/cell_jet_data.py) | Uses `jet_n_clusters` and `cluster_n_cells` to find the cells for each saved jet. |
+| Train the models | [train_cell_models.py](analysis/train_cell_models.py), [train_pairwise_cells.py](analysis/train_pairwise_cells.py) | Trains the cell models using the same event splits. |
+| Compare scores | [compare_part_emil.py](analysis/compare_part_emil.py) | Applies ParT and the stored `jet_BIB_score` to the same test jets. |
+
+The [analysis guide](analysis/README.md) lists the input samples and commands.
+
+## First comparison
+
+For unpaired run `484258` and the held-out LLP simulation, we compared jets
+with ATLAS time above 3 ns and valid scores from both methods. Each score cut
+was chosen to keep at least 95% of delayed LLP jets on validation.
+
+| Score | Unpaired jets tagged as BIB | Simulated LLP jets kept |
+| --- | ---: | ---: |
+| Stored `jet_BIB_score` | 9 / 40 | 782 / 816 |
+| ParT | 40 / 40 | 782 / 816 |
+
+In the smaller 3–10 ns subset with similar $p_T$ and $|\eta|$, ParT kept 11 of
+16 LLP jets and the stored score kept 13. Run `486706` is the next independent
+check and still needs a cell export.
 
 ## Setup
 
@@ -44,7 +66,11 @@ the BIB score, and small test files. We inspected
 [commit a7c625c](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public/-/commit/a7c625c364893bbc90248fbb98a5251c1a54fdeb).
 The exact version used to produce the shared ROOT files still needs confirmation.
 
-## Run
+## Run the notebooks and baseline
+
+- [Notebook 1](analysis/01_remote_data_inventory.ipynb) checks the input files.
+- [Notebook 2](analysis/02_first_data_look.ipynb) plots a small sample.
+- [Notebook 3](analysis/03_xgboost_baseline.ipynb) shows the XGBoost baseline.
 
 ```bash
 python analysis/run_first_look.py 01_remote_data_inventory.ipynb

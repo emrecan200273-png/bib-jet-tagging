@@ -3,6 +3,23 @@
 See the [project README](../README.md) for setup and the XGBoost baseline.
 Run the commands below from the project folder.
 
+## Input samples
+
+Paths are relative to `DataForEmre/`.
+
+| Sample | ROOT folder | How it is used |
+| --- | --- | --- |
+| LLP simulation | `collision/LLP/N1N2_rpv_1400_10ns` | Signal jets with `jet_is_llp_matched == 1`. |
+| Unpaired data | `non_collision/unpaired/physics_Background_NTuple_unsplit_v2` | Jet and cell inputs for the BIB-enriched sample from run `484258`. |
+| Unpaired event keys | `non_collision/unpaired/physics_Background_NTuple` | `JetContent` input to the vertex join. The resulting mapping is applied to `unsplit_v2`. |
+| Vertex counts | `non_collision/unpaired/user.ezaya.UNPAIRED_nPV_nocells.EXT0` | `BIB` tree with `nPrimaryVertices` and event keys. |
+
+The cell reader checks the event key and jet position in the original ROOT
+file before following the jet-to-cluster and cluster-to-cell counts. ParT
+gets the jet summaries and six features per cell: stored time, transformed
+relative energy, $R$, $z$, and the offsets in $\eta$ and $\phi$ from the jet. The stored
+`jet_BIB_score` is used for the comparison.
+
 ## Prepare the vertex counts
 
 The separate vertex files use the `BIB` tree. Match them to the cell files by
@@ -34,9 +51,10 @@ python analysis/train_pairwise_cells.py --particle-net-lite
 python analysis/train_pairwise_cells.py --deep-transformers
 ```
 
-The first two commands compare the jet MLP, Deep Sets and a small Transformer
-with up to 64 cells per jet and with all valid stored cells. The other commands
-run ParT, ParticleNet-Lite and the deeper Transformer variants. Reports in
+The first command trains a jet-level MLP and runs Deep Sets and a small
+Transformer with up to 64 cells per jet. The second runs Deep Sets and the
+Transformer with all valid stored cells. The other commands run ParT,
+ParticleNet-Lite and the deeper Transformer variants. Reports in
 `analysis/outputs/` include test results and the train–validation loss gap.
 The delayed region uses `jet_time_ATLAS > 3` ns.
 
@@ -54,10 +72,23 @@ Run the cell-input check after training ParT. Run the BIB profile study before
 the same-jet comparison so it can read the stored score cut. The comparison
 also reports results in shared $p_T$ and |η| bins and in the 3–10 ns window.
 
+```bash
+python analysis/study_bib_profiles.py
+python analysis/compare_part_emil.py
+```
+
+The same-jet table and score counts go to
+`analysis/outputs/part_emil_same_jets/control_484258/`.
+
 For an independent run, pass `--run`, `--cell-dir` (a `JetContent` export) and
 `--vertex-dir` (the `BIB` sidecar) to `compare_part_emil.py`. Older sidecars
 can store unsigned event IDs in signed 32-bit fields. When verified on a pilot,
 use `--vertex-event-int32-bits` to recover the stored bits before matching them
 against the full event IDs in the cell files.
+
+## Open questions
+
+- Which Athena release and export flags produced `physics_Background_NTuple_unsplit_v2`?
+- Which unpaired trigger selection should we apply consistently across runs `484258` and `486706`?
 
 See [model options](model_options.md) for notes on the papers.
