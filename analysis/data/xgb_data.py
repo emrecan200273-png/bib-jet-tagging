@@ -177,32 +177,41 @@ def read_jet_fields(arrays, jet_counts, context, *, sanitation=None, sample=None
 
 def apply_jet_cuts(clean, keep, flow, *, min_pt_GeV, max_abs_eta, require_mixed):
     """Update the mask and counts after each standard acceptance cut."""
-    pt = clean["jet_pt"] / 1000.0
+    pt = clean["jet_pt"] / 1000.0  # Stored momentum is in MeV.
     eta = clean["jet_eta"]
-    choices = (
-        ("finite_pt_eta_time", np.isfinite(pt) & np.isfinite(eta) & np.isfinite(clean["jet_time_ATLAS"])),
-        ("pt_cut", pt >= min_pt_GeV),
-        ("eta_cut", np.abs(eta) < max_abs_eta),
-        ("mixed_calorimeters" if require_mixed else "valid_tile_fraction",
-         tile_fraction_mask(clean["jet_TileEnergyFrac"], require_mixed=require_mixed)),
-    )
-    for stage, condition in choices:
-        keep &= condition
-        flow[stage] += int(keep.sum())
+    time = clean["jet_time_ATLAS"]
+    keep &= np.isfinite(pt) & np.isfinite(eta) & np.isfinite(time)
+    flow["finite_pt_eta_time"] += int(keep.sum())
+
+    keep &= pt >= min_pt_GeV
+    flow["pt_cut"] += int(keep.sum())
+    keep &= np.abs(eta) < max_abs_eta
+    flow["eta_cut"] += int(keep.sum())
+
+    keep &= tile_fraction_mask(clean["jet_TileEnergyFrac"], require_mixed=require_mixed)
+    calorimeter_stage = "mixed_calorimeters" if require_mixed else "valid_tile_fraction"
+    flow[calorimeter_stage] += int(keep.sum())
     return pt
 
 
 def selected_jet_frame(clean, pt, keep, counts, rows, keys, source, *, sample, label, split=None):
     """Keep the original ROOT row and within-event jet index."""
-    jet_index = np.arange(len(pt)) - np.repeat(np.cumsum(counts) - counts, counts)
-    return pd.DataFrame({
-        "label": label, "sample": sample,
-        **({"split": split} if split is not None else {}),
+    # A ROOT row is one event, with `counts` jets stored next to each other.
+    first_jet_of_event = np.cumsum(counts) - counts
+    event_start_for_each_jet = np.repeat(first_jet_of_event, counts)
+    jet_index = np.arange(len(pt)) - event_start_for_each_jet
+    eta = clean["jet_eta"][keep]
+    columns = {"label": label, "sample": sample}
+    if split is not None:
+        columns["split"] = split
+    columns.update({
         "event_group": np.repeat(keys, counts)[keep], "source_file": source,
         "row_index": np.repeat(rows, counts)[keep], "jet_index": jet_index[keep],
-        "jet_pt_GeV": pt[keep], "jet_eta": clean["jet_eta"][keep], "jet_abs_eta": np.abs(clean["jet_eta"][keep]),
-        **{field: clean[field][keep] for field in (*PHYSICS_FEATURES, "jet_BIB_score")},
+        "jet_pt_GeV": pt[keep], "jet_eta": eta, "jet_abs_eta": np.abs(eta),
     })
+    for field in (*PHYSICS_FEATURES, "jet_BIB_score"):
+        columns[field] = clean[field][keep]
+    return pd.DataFrame(columns)
 
 
 def prepare_training_data(
@@ -272,12 +281,12 @@ def prepare_training_data(
                 except Exception as exc:
                     raise ValueError(f"Invalid jet_pt vectors: {context}") from exc
                 n_jets = int(jet_counts.sum())
-                run = ak.to_numpy(arrays["runNumber"])
-                event = ak.to_numpy(arrays["eventNumber"])
-                for field, ids in [("runNumber", run), ("eventNumber", event)]:
+                run_numbers = ak.to_numpy(arrays["runNumber"])
+                event_numbers = ak.to_numpy(arrays["eventNumber"])
+                for field, ids in (("runNumber", run_numbers), ("eventNumber", event_numbers)):
                     if ids.ndim != 1 or ids.dtype.kind not in "iu" or np.any(ids < 0):
                         raise ValueError(f"Invalid {field}: {context}")
-                event_keys = [f"{sample}:{int(r)}:{int(e)}" for r, e in zip(run, event)]
+                event_keys = [f"{sample}:{int(run)}:{int(event)}" for run, event in zip(run_numbers, event_numbers)]
                 for key in event_keys:
                     if key in seen_events[sample]:
                         raise ValueError(f"Duplicate physical event row: {key} in {relative}")
@@ -298,13 +307,14 @@ def prepare_training_data(
                 flow["truth_selection"] += int(keep.sum())
                 pt = apply_jet_cuts(clean, keep, flow, min_pt_GeV=min_pt_GeV, max_abs_eta=max_abs_eta,
                                     require_mixed=require_mixed_calorimeters)
-                if keep.any():
+                selected_count = int(keep.sum())
+                if selected_count:
                     rows = np.arange(file_events, file_events + len(arrays))
                     parts.append(selected_jet_frame(clean, pt, keep, jet_counts, rows, event_keys, relative,
                                                     sample=sample, label=label))
                 file_events += len(arrays)
                 file_jets += n_jets
-                file_selected += int(keep.sum())
+                file_selected += selected_count
             if file_events != tree.num_entries:
                 raise ValueError(f"Not all ROOT events were read: {relative}")
             file_audits.append({

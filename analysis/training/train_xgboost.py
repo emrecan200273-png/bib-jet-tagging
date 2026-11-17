@@ -72,16 +72,17 @@ def predict_model(model, frame, features):
 def fit_booster(train, val, features, parameters, rounds, train_weights, val_weights, *, include_train_eval=False):
     """Fit with early stopping on validation; optionally record the training history."""
     features = list(features)
-    train_xy = train[features], train["label"]
+    training_set = train[features], train["label"]
     eval_set = [(val[features], val["label"])]
     eval_weights = [val_weights]
     if include_train_eval:
-        eval_set.insert(0, train_xy)
+        eval_set.insert(0, training_set)
         eval_weights.insert(0, train_weights)
+    validation_name = f"validation_{len(eval_set) - 1}"
     model = XGBClassifier(**parameters, callbacks=[EarlyStopping(
-        rounds=rounds, metric_name="logloss", data_name=f"validation_{len(eval_set) - 1}", save_best=True,
+        rounds=rounds, metric_name="logloss", data_name=validation_name, save_best=True,
     )])
-    model.fit(*train_xy, sample_weight=train_weights, eval_set=eval_set,
+    model.fit(*training_set, sample_weight=train_weights, eval_set=eval_set,
               sample_weight_eval_set=eval_weights, verbose=False)
     return model
 
@@ -103,45 +104,45 @@ def score_saved_model(frame, output_dir):
     momenta are in GeV, eta is dimensionless, and stored timing is in ns.
     """
     output_dir = Path(output_dir)
-    spec = json.loads((output_dir / "feature_schema.json").read_text())
-    features = spec["features"]
+    schema = json.loads((output_dir / "feature_schema.json").read_text())
+    features = schema["features"]
     required = set(features) | {"jet_pt_GeV", "jet_eta"}
-    if required - set(frame.columns):
-        raise ValueError(f"Missing input columns: {sorted(required - set(frame.columns))}")
-    x = frame.copy()
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing input columns: {sorted(missing)}")
+    inputs = frame.copy()
     numeric = list(required)
-    x[numeric] = x[numeric].astype(float).replace([-999999.0, np.inf, -np.inf], np.nan)
+    inputs[numeric] = inputs[numeric].astype(float).replace([-999999.0, np.inf, -np.inf], np.nan)
     for field in features:
-        values = sanitize_values(x[field].to_numpy())
+        values = sanitize_values(inputs[field].to_numpy())
         values[physical_invalid_mask(field, values)] = np.nan
-        x[field] = values
-    sel = spec["selection"]
-    valid = (
-        x["jet_pt_GeV"].ge(sel["min_pt_GeV"])
-        & x["jet_eta"].abs().lt(sel["max_abs_eta"])
-        & np.isfinite(x["jet_eta"])
-        & np.isfinite(x["jet_time_ATLAS"])
-        & tile_fraction_mask(x["jet_TileEnergyFrac"], require_mixed=True)
+        inputs[field] = values
+    selection = schema["selection"]
+    pt, abs_eta = inputs["jet_pt_GeV"], inputs["jet_eta"].abs()
+    in_selection = (
+        pt.ge(selection["min_pt_GeV"])
+        & abs_eta.lt(selection["max_abs_eta"])
+        & np.isfinite(abs_eta)
+        & np.isfinite(inputs["jet_time_ATLAS"])
+        & tile_fraction_mask(inputs["jet_TileEnergyFrac"], require_mixed=True)
     )
-    support = spec.get("kinematic_support")
+    support = schema.get("kinematic_support")
     if support:
-        pt_edges = np.asarray(support["pt_edges_GeV"])
-        eta_edges = np.asarray(support["abs_eta_edges"])
-        pt = x["jet_pt_GeV"].to_numpy()
-        eta = x["jet_eta"].abs().to_numpy()
-        pt_bin = _bin_indices(pt, pt_edges)
-        eta_bin = _bin_indices(eta, eta_edges)
+        pt_bin = _bin_indices(pt, np.asarray(support["pt_edges_GeV"]))
+        eta_bin = _bin_indices(abs_eta, np.asarray(support["abs_eta_edges"]))
         bins = {(b["pt_bin"], b["eta_bin"]) for b in support["supported_bins"]}
         supported = np.array([(p, e) in bins for p, e in zip(pt_bin, eta_bin)], dtype=bool)
-        valid &= (pt_bin >= 0) & (eta_bin >= 0) & supported
+        in_selection &= (pt_bin >= 0) & (eta_bin >= 0) & supported
+
     model = XGBClassifier()
     model.load_model(output_dir / "xgboost.ubj")
-    scores = np.full(len(x), np.nan)
-    if valid.any():
-        scores[np.flatnonzero(valid)] = predict_model(model, x.loc[valid], features)
-    tags = pd.array([pd.NA] * len(x), dtype="boolean")
-    tags[np.flatnonzero(valid)] = scores[valid] >= spec["threshold"]
-    return pd.DataFrame({"in_selection": valid.to_numpy(), "bib_score": scores,
+    selected_rows = np.flatnonzero(in_selection)
+    scores = np.full(len(frame), np.nan)
+    tags = pd.array([pd.NA] * len(frame), dtype="boolean")
+    if selected_rows.size:
+        scores[selected_rows] = predict_model(model, inputs.iloc[selected_rows], features)
+        tags[selected_rows] = scores[selected_rows] >= schema["threshold"]
+    return pd.DataFrame({"in_selection": in_selection.to_numpy(), "bib_score": scores,
                          "tagged_as_bib": tags}, index=frame.index)
 
 
@@ -163,23 +164,27 @@ def _subset_report(frame, scores, threshold, seed):
 
 def _fit_models(train, validation, params, target, output_dir, *, matched=False):
     """Fit each feature set, lock its validation cut, and verify the saved model."""
-    train_w, val_w = (balanced_weights(frame.label, train.label) for frame in (train, validation))
+    train_weights = balanced_weights(train.label, train.label)
+    validation_weights = balanced_weights(validation.label, train.label)
     models, thresholds, histories, metrics, importance = {}, {}, {}, {}, []
     for name, features in MODEL_FEATURES.items():
         if not matched:
             print(f"Training {name}: {', '.join(features)}", flush=True)
-        model = fit_booster(train, validation, features, params, EARLY_STOP_ROUNDS, train_w, val_w,
-                            include_train_eval=True)
-        val_scores = predict_model(model, validation, features)
-        cut = choose_threshold(validation.label, val_scores, target)
-        _save_and_verify_model(model, output_dir / f"{MODEL_SLUGS[name]}.ubj", validation, features, val_scores,
+        model = fit_booster(train, validation, features, params, EARLY_STOP_ROUNDS,
+                            train_weights, validation_weights, include_train_eval=True)
+        validation_scores = predict_model(model, validation, features)
+        threshold = choose_threshold(validation.label, validation_scores, target)
+        _save_and_verify_model(model, output_dir / f"{MODEL_SLUGS[name]}.ubj", validation, features, validation_scores,
                                "Saved model predictions differ after loading.")
-        models[name], thresholds[name], histories[name] = model, cut, model.evals_result()
+        models[name] = model
+        thresholds[name] = threshold
+        histories[name] = model.evals_result()
         details = {"features": features}
         if not matched:
             details["best_iteration_zero_based"] = int(model.best_iteration)
-        metrics[name] = dict(details, saved_trees=int(model.get_booster().num_boosted_rounds()),
-                             validation=evaluate_scores(validation, val_scores, cut, bootstrap_repeats=0))
+        details["saved_trees"] = int(model.get_booster().num_boosted_rounds())
+        details["validation"] = evaluate_scores(validation, validation_scores, threshold, bootstrap_repeats=0)
+        metrics[name] = details
         importance.extend({"model": name, "feature": field, "importance": float(gain)}
                           for field, gain in zip(features, model.feature_importances_))
     return models, thresholds, histories, metrics, pd.DataFrame(importance)
@@ -187,16 +192,18 @@ def _fit_models(train, validation, params, target, output_dir, *, matched=False)
 
 def _test_models(test, models, thresholds, metrics, seed, *, matched=False):
     """Evaluate already fitted models with their frozen validation cuts."""
-    scores = {}
+    scores_by_model = {}
     for name, model in models.items():
-        score = scores[name] = predict_model(model, test, MODEL_FEATURES[name])
-        cut = thresholds[name]
-        stats = metrics[name]["test"] = evaluate_scores(test, score, cut, seed=seed)
-        metrics[name]["test_regions"] = _subset_report(test, score, cut, seed)
+        test_scores = predict_model(model, test, MODEL_FEATURES[name])
+        scores_by_model[name] = test_scores
+        threshold = thresholds[name]
+        stats = evaluate_scores(test, test_scores, threshold, seed=seed)
+        metrics[name]["test"] = stats
+        metrics[name]["test_regions"] = _subset_report(test, test_scores, threshold, seed)
         heading = f"Matched {name}: AUC" if matched else f"{name}: test AUC"
         print(f"{heading}={stats['roc_auc']:.4f}; BIB tag={stats['bib_tag_fraction']:.1%}, "
               f"LLP keep={stats['llp_keep_fraction']:.1%}", flush=True)
-    return scores
+    return scores_by_model
 
 
 def _write_predictions(test, scores, output_dir, *, thresholds=None):

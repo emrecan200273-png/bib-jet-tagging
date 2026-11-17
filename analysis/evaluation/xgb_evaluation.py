@@ -59,15 +59,16 @@ def choose_threshold(y, scores, target_llp_keep=0.95):
     y, scores = _inputs(y, scores)
     if not np.isfinite(target_llp_keep) or not 0 < target_llp_keep <= 1:
         raise ValueError("target_llp_keep must be in (0, 1].")
-    llp = scores[y == 0]
-    if not len(llp):
+    llp_scores = scores[y == 0]
+    count = len(llp_scores)
+    if not count:
         raise ValueError("Threshold selection needs at least one LLP jet.")
-    k = min(len(llp), int(np.ceil(target_llp_keep * len(llp))))
+    keep_count = min(count, int(np.ceil(target_llp_keep * count)))
     # Avoid an extra jet from a multiplication such as 0.07 * 100 rounding up.
-    while k > 1 and (k - 1) / len(llp) >= target_llp_keep:
-        k -= 1
-    selected = np.partition(llp, k - 1)[k - 1]
-    threshold = float(np.nextafter(selected, np.inf))
+    while keep_count > 1 and (keep_count - 1) / count >= target_llp_keep:
+        keep_count -= 1
+    last_kept_score = np.partition(llp_scores, keep_count - 1)[keep_count - 1]
+    threshold = float(np.nextafter(last_kept_score, np.inf))
     if not np.isfinite(threshold):
         raise ValueError("The LLP scores are too large to form a finite threshold.")
     return threshold
@@ -78,11 +79,11 @@ def weighted_cut(frame, scores, weights, target):
     signal = frame["label"].eq(0).to_numpy() & (weights > 0)
     if not signal.any():
         raise ValueError("Common kinematic validation needs LLP jets")
-    values, mass = scores[signal], weights[signal]
-    ordered = np.argsort(values)
-    cumulative = np.cumsum(mass[ordered])
-    edge = np.searchsorted(cumulative, target * cumulative[-1])
-    return float(np.nextafter(values[ordered[edge]], np.inf))
+    llp_scores, llp_weights = scores[signal], weights[signal]
+    score_order = np.argsort(llp_scores)
+    retained_weight = np.cumsum(llp_weights[score_order])
+    cutoff_index = np.searchsorted(retained_weight, target * retained_weight[-1])
+    return float(np.nextafter(llp_scores[score_order[cutoff_index]], np.inf))
 
 
 def rates(frame, scores, threshold, weights=None):
@@ -103,45 +104,45 @@ def rates(frame, scores, threshold, weights=None):
     return result
 
 
-def _event_bootstrap(y, tagged, groups, repeats, seed):
-    """Resample events; omit boundary intervals that would imply certainty.
+def _event_bootstrap(labels, tagged, groups, repeats, seed):
+    """Estimate intervals by drawing whole events with replacement.
 
-    If every observed class jet succeeds or every jet fails, the empirical
-    bootstrap cannot produce an unseen outcome. Returning [0, 0] or [1, 1]
-    would therefore hide the uncertainty, especially for small subgroups.
+    Each time an event is drawn, include all of its jets. In each draw, divide
+    the number of successful jets by the total for that class. Skip draws that
+    lack the class. If the observed rate is 0 or 1, the resampling cannot
+    create an unseen outcome, so omit that interval.
     """
     if repeats == 0:
         return None, None
-    codes, unique_groups = pd.factorize(groups, sort=False)
-    n_events = len(unique_groups)
-    totals = np.column_stack([
-        np.bincount(codes, weights=(y == label), minlength=n_events)
-        for label in (0, 1)
+    event_ids, events = pd.factorize(groups, sort=False)
+    n_events = len(events)
+    is_llp, is_bib = labels == 0, labels == 1
+    # Columns count LLP retention and BIB tagging, in that order.
+    jets_per_event = np.column_stack([
+        np.bincount(event_ids, weights=mask, minlength=n_events)
+        for mask in (is_llp, is_bib)
     ])
-    successes = np.column_stack([
-        np.bincount(codes, weights=((y == 0) & ~tagged), minlength=n_events),
-        np.bincount(codes, weights=((y == 1) & tagged), minlength=n_events),
+    successes_per_event = np.column_stack([
+        np.bincount(event_ids, weights=mask, minlength=n_events)
+        for mask in (is_llp & ~tagged, is_bib & tagged)
     ])
     rng = np.random.default_rng(seed)
-    rates = np.full((repeats, 2), np.nan)
+    sampled_rates = np.full((repeats, 2), np.nan)
     for i in range(repeats):
         selected_events = rng.integers(0, n_events, size=n_events)
-        denominator = totals[selected_events].sum(axis=0)
-        numerator = successes[selected_events].sum(axis=0)
-        np.divide(numerator, denominator, out=rates[i], where=denominator > 0)
+        denominator = jets_per_event[selected_events].sum(axis=0)
+        numerator = successes_per_event[selected_events].sum(axis=0)
+        np.divide(numerator, denominator, out=sampled_rates[i], where=denominator > 0)
     intervals = []
-    observed_n = totals.sum(axis=0)
-    observed_success = successes.sum(axis=0)
-    for column in range(2):
-        finite = rates[:, column][np.isfinite(rates[:, column])]
-        boundary = (observed_n[column] == 0 or observed_success[column] == 0
-                    or observed_success[column] == observed_n[column])
+    for class_rates, total, successes in zip(sampled_rates.T, jets_per_event.sum(axis=0),
+                                             successes_per_event.sum(axis=0), strict=True):
+        finite = class_rates[np.isfinite(class_rates)]
         intervals.append(
             [float(x) for x in np.quantile(finite, [0.025, 0.975])]
-            if len(finite) and not boundary else None
+            if len(finite) and 0 < successes < total else None
         )
-    # Caller reports BIB tagging before LLP retention.
-    return intervals[1], intervals[0]
+    llp_interval, bib_interval = intervals
+    return bib_interval, llp_interval
 
 
 def evaluate_scores(frame, scores, threshold, *, bootstrap_repeats=200, seed=42):
@@ -166,32 +167,30 @@ def evaluate_scores(frame, scores, threshold, *, bootstrap_repeats=200, seed=42)
         raise ValueError("bootstrap_repeats must be a nonnegative integer.")
     if not np.isfinite(threshold):
         raise ValueError("The threshold must be finite.")
-    y, scores = _inputs(frame["label"], scores)
+    labels, scores = _inputs(frame["label"], scores)
     tagged = scores >= threshold
-    n_bib = int(np.sum(y == 1))
-    n_llp = int(np.sum(y == 0))
-    tp = int(np.sum((y == 1) & tagged))
-    fn = n_bib - tp
-    fp = int(np.sum((y == 0) & tagged))
-    tn = n_llp - fp
+    is_bib, is_llp = labels == 1, labels == 0
+    n_bib, n_llp = int(is_bib.sum()), int(is_llp.sum())
+    bib_tagged = int((is_bib & tagged).sum())
+    llp_kept = int((is_llp & ~tagged).sum())
     bib_ci, llp_ci = _event_bootstrap(
-        y, tagged, frame["event_group"].to_numpy(), bootstrap_repeats, seed,
+        labels, tagged, frame["event_group"].to_numpy(), bootstrap_repeats, seed,
     )
     return {
-        "n_jets": int(len(y)),
+        "n_jets": int(len(labels)),
         "n_events": int(frame["event_group"].nunique()),
         "class_counts": {"BIB": n_bib, "LLP": n_llp},
-        "observed_bib_fraction": float(n_bib / len(y)),
-        "roc_auc": float(roc_auc_score(y, scores)) if n_bib and n_llp else None,
-        "average_precision": float(average_precision_score(y, scores)) if n_bib and n_llp else None,
+        "observed_bib_fraction": float(n_bib / len(labels)),
+        "roc_auc": float(roc_auc_score(labels, scores)) if n_bib and n_llp else None,
+        "average_precision": float(average_precision_score(labels, scores)) if n_bib and n_llp else None,
         "threshold": float(threshold),
-        "bib_tag_fraction": float(tp / n_bib) if n_bib else None,
-        "llp_keep_fraction": float(tn / n_llp) if n_llp else None,
+        "bib_tag_fraction": float(bib_tagged / n_bib) if n_bib else None,
+        "llp_keep_fraction": float(llp_kept / n_llp) if n_llp else None,
         "bib_tag_fraction_ci95": bib_ci,
         "llp_keep_fraction_ci95": llp_ci,
         "confusion": {
-            "BIB_tagged_BIB": tp, "BIB_kept_as_LLP": fn,
-            "LLP_tagged_BIB": fp, "LLP_kept_as_LLP": tn,
+            "BIB_tagged_BIB": bib_tagged, "BIB_kept_as_LLP": n_bib - bib_tagged,
+            "LLP_tagged_BIB": n_llp - llp_kept, "LLP_kept_as_LLP": llp_kept,
         },
         "bootstrap": {
             "unit": "event_group", "repeats": int(bootstrap_repeats),

@@ -27,30 +27,37 @@ class ClusterCellTransformer(nn.Module):
         self.classifier = jet_classifier(jet_dim + WIDTH)
 
     def _pool_clusters(self, cells, valid):
-        cluster = cells[..., -1].masked_fill(~valid, -1).long()
-        count = int(cluster.amax().item()) + 1 if cluster.numel() else 0
-        if not count:
+        # The stored ID groups cells for pooling. The encoder reads the six cell features.
+        cluster_ids = cells[..., -1].masked_fill(~valid, -1).long()
+        cluster_count = int(cluster_ids.amax().item()) + 1 if cluster_ids.numel() else 0
+        if not cluster_count:
             return cells.new_zeros((len(cells), 0, WIDTH)), valid[:, :0]
 
-        encoded = self.cell_encoder(cells[..., :-1].masked_fill(~valid[..., None], 0))
-        logits = self.cell_attention(encoded)
-        cluster = cluster.clamp_min(0)[..., None].expand(-1, -1, HEADS)
+        cell_embeddings = self.cell_encoder(cells[..., :-1].masked_fill(~valid[..., None], 0))
+        weight_logits = self.cell_attention(cell_embeddings)
+        cluster_indices = cluster_ids.clamp_min(0)[..., None].expand(-1, -1, HEADS)
+        # Subtract the largest logit in each cluster before exponentiating.
         with torch.no_grad():
-            maxima = logits.new_full((len(cells), count, HEADS), -torch.inf)
-            maxima.scatter_reduce_(1, cluster, logits.masked_fill(~valid[..., None], -torch.inf), reduce="amax")
-            shift = maxima.gather(1, cluster).masked_fill(~valid[..., None], 0)
-        weights = (logits - shift).masked_fill(~valid[..., None], -torch.inf).exp()
-        totals = weights.new_zeros((len(cells), count, HEADS)).scatter_add(1, cluster, weights)
-        values = encoded.unflatten(-1, (HEADS, WIDTH // HEADS)) * weights[..., None]
-        pooled = values.new_zeros((len(cells), count, HEADS, WIDTH // HEADS)).scatter_add(
-            1, cluster[..., None].expand_as(values), values,
+            cluster_maxima = weight_logits.new_full((len(cells), cluster_count, HEADS), -torch.inf)
+            cluster_maxima.scatter_reduce_(
+                1, cluster_indices, weight_logits.masked_fill(~valid[..., None], -torch.inf), reduce="amax",
+            )
+            cell_maxima = cluster_maxima.gather(1, cluster_indices).masked_fill(~valid[..., None], 0)
+        weights = (weight_logits - cell_maxima).masked_fill(~valid[..., None], -torch.inf).exp()
+        weight_sums = weights.new_zeros((len(cells), cluster_count, HEADS)).scatter_add(1, cluster_indices, weights)
+        weighted_cells = cell_embeddings.unflatten(-1, (HEADS, WIDTH // HEADS)) * weights[..., None]
+        cluster_sums = weighted_cells.new_zeros((len(cells), cluster_count, HEADS, WIDTH // HEADS)).scatter_add(
+            1, cluster_indices[..., None].expand_as(weighted_cells), weighted_cells,
         )
-        return (pooled / totals.clamp_min(1e-12)[..., None]).flatten(2), totals[..., 0] > 0
+        cluster_embeddings = (cluster_sums / weight_sums.clamp_min(1e-12)[..., None]).flatten(2)
+        return cluster_embeddings, weight_sums[..., 0] > 0
 
     def forward(self, jets, cells, mask):
-        clusters, valid = self._pool_clusters(cells, mask.bool())
-        tokens = torch.cat((self.summary.expand(len(jets), -1, -1), clusters), dim=1)
-        padding = torch.cat((valid.new_zeros((len(jets), 1)), ~valid), dim=1)
+        cluster_embeddings, valid_clusters = self._pool_clusters(cells, mask.bool())
+        # The first token summarizes the jet and is valid even without clusters.
+        tokens = torch.cat((self.summary.expand(len(jets), -1, -1), cluster_embeddings), dim=1)
+        padding_mask = torch.cat((valid_clusters.new_zeros((len(jets), 1)), ~valid_clusters), dim=1)
         for layer in self.cluster_layers:
-            tokens = layer(tokens, src_key_padding_mask=padding)
-        return self.classifier(torch.cat((jets, tokens[:, 0]), dim=-1)).squeeze(-1)
+            tokens = layer(tokens, src_key_padding_mask=padding_mask)
+        jet_summary = tokens[:, 0]
+        return self.classifier(torch.cat((jets, jet_summary), dim=-1)).squeeze(-1)

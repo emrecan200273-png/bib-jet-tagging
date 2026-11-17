@@ -137,7 +137,7 @@ def _nonnegative(values):
 
 def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, target_keys, counts,
                           *, signed_event_column=None):
-    """Count every raw row; materialize only rows that match a local cell key."""
+    """Count every vertex row and keep only rows with a matching cell event."""
     for offset, ids, values in read_chunks(tree, path, key_fields, vertex_field):
         if signed_event_column is not None:
             events = ids[signed_event_column]
@@ -145,6 +145,7 @@ def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, t
                 raise ValueError(f"{path}: eventNumber must be signed int32 in bit-pattern mode")
             negative_events = np.ma.filled(events < 0, False)
             counts["reinterpreted_negative_vertex_event_rows"] += int(negative_events.sum())
+            # Recover the bits from the old signed sidecar. Cell IDs stay full-width.
             ids[signed_event_column] = events.astype(np.uint32)
         size = len(values)
         counts["vertex_rows"] += size
@@ -161,10 +162,12 @@ def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, t
         valid_rows = np.flatnonzero(valid_ids)
         counts["invalid_vertex_key_rows"] += size - len(valid_rows)
         if len(target_keys):
+            # Find the insertion point in the sorted cell keys, then check equality.
             positions = np.searchsorted(target_keys, keys[valid_rows])
-            inside = positions < len(target_keys)
-            rows = valid_rows[inside]
-            matching_rows = rows[target_keys[positions[inside]] == keys[rows]]
+            within_range = positions < len(target_keys)
+            candidate_rows = valid_rows[within_range]
+            matching_keys = target_keys[positions[within_range]] == keys[candidate_rows]
+            matching_rows = candidate_rows[matching_keys]
         else:
             matching_rows = valid_rows[:0]
         counts["matched_vertex_rows"] += len(matching_rows)
@@ -240,17 +243,17 @@ def _index_vertices(files, directory, key_fields, tree_name, branch, target_keys
 
 def _join_events(cell_rows, vertices, counts):
     records = []
-    for row in cell_rows:
-        sidecar = vertices.get(row.key)
+    for cell in cell_rows:
+        vertex = vertices.get(cell.key)
         count = None
-        if None in row.key:
+        if None in cell.key:
             status = "invalid_cell_key"
-        elif sidecar is None:
+        elif vertex is None:
             counts["unmatched_cell_events"] += 1
             status = "unmatched"
         else:
             counts["key_matched_events"] += 1
-            count = valid_count(sidecar.value)
+            count = valid_count(vertex.value)
             if count is None:
                 counts["matched_invalid_vertex_count"] += 1
                 status = "invalid_vertex_count"
@@ -259,8 +262,8 @@ def _join_events(cell_rows, vertices, counts):
                 counts["matched_zero_vertex_count"] += count == 0
                 status = "matched"
         records.append((
-            row.file, row.entry, *row.key, count, status,
-            sidecar.file if sidecar else None, sidecar.entry if sidecar else None,
+            cell.file, cell.entry, *cell.key, count, status,
+            vertex.file if vertex else None, vertex.entry if vertex else None,
         ))
     return records
 
@@ -277,6 +280,7 @@ def match(
     matched_only=False,
     vertex_event_int32_bits=False,
 ):
+    """Index the cell and vertex events, then join them by their stored IDs."""
     cell_dir, vertex_dir = Path(cell_dir).resolve(), Path(vertex_dir).resolve()
     if vertex_dir.is_relative_to(cell_dir) or cell_dir.is_relative_to(vertex_dir):
         raise ValueError("Use separate cell and vertex input directories")

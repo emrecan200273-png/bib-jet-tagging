@@ -42,12 +42,12 @@ def prepare_part(jets, data_root, checkpoint, threads):
 
 def score_part(jets, data_root, checkpoint, settings):
     model, inputs, audit = prepare_part(jets, data_root, checkpoint, settings["threads"])
-    lengths = inputs[2].sum(1)
-    usable = torch.nonzero(lengths, as_tuple=True)[0]
+    cells_per_jet = inputs[2].sum(1)
+    jets_with_cells = torch.nonzero(cells_per_jet, as_tuple=True)[0]
     probabilities = np.full(len(jets), np.nan, dtype=np.float64)
-    if len(usable):
-        scores = predict_logits(model, inputs, usable, settings["batch_size"], lengths)
-        probabilities[usable.numpy()] = scores.sigmoid().numpy()
+    if len(jets_with_cells):
+        logits = predict_logits(model, inputs, jets_with_cells, settings["batch_size"], cells_per_jet)
+        probabilities[jets_with_cells.numpy()] = logits.sigmoid().numpy()
     return probabilities, audit
 
 
@@ -61,22 +61,27 @@ def check_part_replay(jets, reference, replayed):
 
 
 def run_comparison(root, cell_dir=None, vertex_dir=None, run=None, *, vertex_event_int32_bits=False):
-    root = Path(root).resolve()
-    outputs = root / "analysis/outputs"
+    """Score the original test jets or replace their unpaired sample with a new run."""
+    project_root = Path(root).resolve()
+    outputs = project_root / "analysis/outputs"
     stored_part = outputs / "pairwise_cell_comparison"
     stored_profiles = outputs / "bib_profile_study/metrics.json"
     part_report = json.loads((stored_part / "metrics.json").read_text())
     profile_report = json.loads(stored_profiles.read_text())
     checkpoint = torch.load(stored_part / "neural_model.pt", weights_only=True)
-    cuts = {"part": part_report["thresholds_from_delayed_validation_jets"]["pairwise_transformer"],
-            "emil": profile_report["calibration"]["raw"]["stored_emil"]["value"]}
+    cuts = {
+        "part": part_report["thresholds_from_delayed_validation_jets"]["pairwise_transformer"],
+        "emil": profile_report["calibration"]["raw"]["stored_emil"]["value"],
+    }
     if checkpoint["delayed_threshold"] != cuts["part"]:
         raise ValueError("ParT checkpoint and validation report have different delayed cuts")
-    _, old = load_jets(outputs / "xgboost_baseline/training_jets.csv.gz",
-                       outputs / "unpaired_vertex_match/event_mapping.csv.gz")
-    control = old.loc[old["split"].eq("test")].reset_index(drop=True)
-    data_root, _ = resolve_data_paths(root)
+
+    _, original_jets = load_jets(outputs / "xgboost_baseline/training_jets.csv.gz",
+                                 outputs / "unpaired_vertex_match/event_mapping.csv.gz")
+    control = original_jets.loc[original_jets["split"].eq("test")].reset_index(drop=True)
+    data_root, _ = resolve_data_paths(project_root)
     reference_predictions = pd.read_csv(stored_part / "test_predictions.csv.gz")
+    # Replay the checkpoint to verify the saved test scores before comparing them.
     control_scores, extraction = score_part(control, data_root, checkpoint, part_report["settings"])
     reference_scores = check_part_replay(control, reference_predictions, control_scores)
     control = control.assign(part=reference_scores, emil=control["jet_BIB_score"])
@@ -85,50 +90,59 @@ def run_comparison(root, cell_dir=None, vertex_dir=None, run=None, *, vertex_eve
     if cell_dir is not None:
         from analysis.data.external_tagging_jets import load_external_jets
 
-        if old["event_group"].str.startswith(f"unpaired:{run}:").any():
+        if original_jets["event_group"].str.startswith(f"unpaired:{run}:").any():
             raise ValueError(f"Run {run} is part of the original dataset; use the original test mode")
-        new, input_audit = load_external_jets(cell_dir, vertex_dir, run,
-                                             vertex_event_int32_bits=vertex_event_int32_bits)
-        if new.empty:
+        new_jets, input_audit = load_external_jets(cell_dir, vertex_dir, run,
+                                                  vertex_event_int32_bits=vertex_event_int32_bits)
+        if new_jets.empty:
             raise ValueError(f"Run {run} has no eligible cell jets in these files ({input_audit['status']})")
-        values, extraction = score_part(new, Path(cell_dir).resolve(), checkpoint, part_report["settings"])
-        new = new.assign(part=values, emil=new["jet_BIB_score"])
-        if not np.isfinite(new[list(MODELS)].to_numpy()).all(axis=1).any():
+        new_scores, extraction = score_part(new_jets, Path(cell_dir).resolve(), checkpoint, part_report["settings"])
+        new_jets = new_jets.assign(part=new_scores, emil=new_jets["jet_BIB_score"])
+        finite_scores = np.isfinite(new_jets[list(MODELS)].to_numpy())
+        if not finite_scores.all(axis=1).any():
             raise ValueError(f"Run {run} has no jets with both a valid ParT score and a valid stored BIB score")
-        sample = pd.concat([control.loc[control["sample"].eq("LLP")], new], ignore_index=True)
+        llp_jets = control.loc[control["sample"].eq("LLP")]
+        sample = pd.concat([llp_jets, new_jets], ignore_index=True)
 
-    sample = sample.assign(common_scores=np.isfinite(sample[list(MODELS)].to_numpy()).all(axis=1))
     if sample.duplicated(["event_group", "jet_index"]).any():
         raise ValueError("The comparison contains duplicate jets")
-    decisions = [f"{name}_tagged" for name in MODELS]
-    for name, decision in zip(MODELS, decisions, strict=True):
-        sample[decision] = sample[name].ge(cuts[name]).astype("boolean").where(sample["common_scores"])
-    valid = sample.loc[sample["common_scores"]]
-    regions = jet_time_regions(valid)
+    finite_scores = np.isfinite(sample[list(MODELS)].to_numpy())
+    sample["common_scores"] = finite_scores.all(axis=1)
+    for name in MODELS:
+        tagged = sample[name].ge(cuts[name]).astype("boolean")
+        sample[f"{name}_tagged"] = tagged.where(sample["common_scores"])
+    same_jets = sample.loc[sample["common_scores"]]
+    regions = jet_time_regions(same_jets)
     results = {}
     for region, mask in regions.items():
-        subset = valid.loc[mask]
+        subset = same_jets.loc[mask]
         if subset.empty:
             continue
         scores = {name: subset[name].to_numpy() for name in MODELS}
-        results[region] = {"models": {name: evaluate_scores(subset, score, cuts[name], seed=42, bootstrap_repeats=2000)
-                                      for name, score in scores.items()},
-                           "part_minus_emil": {key: paired_interval(subset, scores, cuts, label, 42, model_names=MODELS)
-                                               for key, label in [("llp_kept", 0), ("unpaired_tagged", 1)]}}
-    bins, shared_rates = kinematic_comparison(old.loc[old["split"].eq("train")], valid, MODELS, region_masks=regions)
+        model_results = {
+            name: evaluate_scores(subset, score, cuts[name], seed=42, bootstrap_repeats=2000)
+            for name, score in scores.items()
+        }
+        improvements = {
+            "llp_kept": paired_interval(subset, scores, cuts, 0, 42, model_names=MODELS),
+            "unpaired_tagged": paired_interval(subset, scores, cuts, 1, 42, model_names=MODELS),
+        }
+        results[region] = {"models": model_results, "part_minus_emil": improvements}
+    train_jets = original_jets.loc[original_jets["split"].eq("train")]
+    bins, shared_rates = kinematic_comparison(train_jets, same_jets, MODELS, region_masks=regions)
     stage = f"run_{run}" if cell_dir is not None else "control_484258"
     output = outputs / "part_emil_same_jets" / stage
     output.mkdir(parents=True, exist_ok=True)
     fields = [*IDENTITY, "sample", "label", "jet_time_ATLAS", "jet_pt_GeV", "jet_abs_eta",
-              "common_scores", *MODELS, *decisions]
+              "common_scores", *MODELS, *(f"{name}_tagged" for name in MODELS)]
     sample[fields].to_csv(output / "scores.csv.gz", index=False)
     bins.to_csv(output / "kinematic_bins.csv", index=False)
+    coverage = sample.groupby("sample").agg(total=("label", "size"), common=("common_scores", "sum"))
     write_json(output / "metrics.json", {
         "sample": stage, "delayed_validation_cuts": cuts,
         "scope": "Same jets with finite scores. Fixed cuts from the original delayed validation. "
                  "The held-out LLP simulation is shared across the control and any external runs.",
-        "coverage": sample.groupby("sample").agg(total=("label", "size"), common=("common_scores", "sum"))
-        .reset_index().to_dict(orient="records"),
+        "coverage": coverage.reset_index().to_dict(orient="records"),
         "cell_extraction": extraction["overall"], "external_input": input_audit, "comparisons": results,
         "shared_kinematics": {
             "method": "Retain original training-supported pT and |eta| bins populated by both classes in the test region. "

@@ -1,4 +1,4 @@
-"""Train and compare uncapped neural models on the same calorimeter-cell data."""
+"""Train calorimeter-cell models and compare scores on the same saved test split."""
 
 import argparse
 from importlib.metadata import version
@@ -42,6 +42,7 @@ PARTICLE_NET_BATCH_CELLS = 8192
 
 
 def _paired_changes(test, test_scores, cuts, delayed_cuts, seed, references, trained):
+    """Compare tag rates on the same jets, with intervals sampled by event."""
     pairs = [(reference, name) for reference in references for name in trained]
     if trained == (DEEP, BIB):
         pairs.append((DEEP, BIB))
@@ -63,43 +64,45 @@ def _paired_changes(test, test_scores, cuts, delayed_cuts, seed, references, tra
 
 
 def run_comparison(project_root, threads, architecture, output_override=None):
+    """Reuse the saved jet selection and scaling, fit new models and write test scores."""
     root = Path(project_root).resolve()
     outputs = root / "analysis/outputs"
     graph = architecture == PARTICLE_NET
     deep = architecture == DEEP
-    advanced = architecture in (SET, CLUSTER)
+    report_delayed_kinematics = architecture in (SET, CLUSTER)
     folder, references, trained = COMPARISONS[architecture]
-    previous_folder = "cell_model_full_comparison" if architecture == PAIRWISE else COMPARISONS[PAIRWISE][0]
-    previous_dir = outputs / previous_folder
+    reference_folder = "cell_model_full_comparison" if architecture == PAIRWISE else COMPARISONS[PAIRWISE][0]
+    reference_dir = outputs / reference_folder
     output_dir = outputs / folder if output_override is None else Path(output_override).resolve()
     names = {name: DISPLAY_NAMES[name] for name in (*references, *trained)}
-    previous_report = previous_dir / "metrics.json"
-    previous_predictions = previous_dir / "test_predictions.csv.gz"
+    reference_metrics_path = reference_dir / "metrics.json"
+    reference_predictions_path = reference_dir / "test_predictions.csv.gz"
     jet_table = outputs / "xgboost_baseline/training_jets.csv.gz"
     vertex_map = outputs / "unpaired_vertex_match/event_mapping.csv.gz"
     data_root, manifest = resolve_data_paths(root)
-    if output_dir.is_relative_to(data_root.resolve()) or output_dir.is_relative_to(previous_dir):
+    if output_dir.is_relative_to(data_root.resolve()) or output_dir.is_relative_to(reference_dir):
         raise ValueError("Write the comparison outside the input data and reference outputs")
-    previous = json.loads(previous_report.read_text())
-    settings = previous["settings"]
-    if settings["max_cells"] is not None or previous["cell_features"] != list(CELL_FEATURES):
+    reference_metrics = json.loads(reference_metrics_path.read_text())
+    settings = reference_metrics["settings"]
+    if settings["max_cells"] is not None or reference_metrics["cell_features"] != list(CELL_FEATURES):
         raise ValueError("Expected a saved uncapped comparison with matching cell inputs")
-    seed, target = settings["seed"], previous["target_llp_keep_on_validation"]
+    seed, target = settings["seed"], reference_metrics["target_llp_keep_on_validation"]
     batch_size = settings["batch_size"]
-    hashes = pilot.input_hashes((jet_table, vertex_map, manifest, previous_report, previous_predictions))
+    hashes = pilot.input_hashes((jet_table, vertex_map, manifest, reference_metrics_path, reference_predictions_path))
     for path in (jet_table, vertex_map, manifest):
-        if hashes[str(path)] != previous["inputs_sha256"].get(str(path.resolve())):
+        if hashes[str(path)] != reference_metrics["inputs_sha256"].get(str(path.resolve())):
             raise ValueError(f"Input differs from the saved comparison: {path}")
 
+    # Load LLP and zero-vertex unpaired jets with their existing event split.
     _, jets = load_jets(jet_table, vertex_map)
     jets = jets.reset_index(drop=True)
     indices = pilot.split_indices(jets)
     val_frame, test_frame = (jets.iloc[indices[split].numpy()] for split in ("validation", "test"))
-    reference_test = pd.read_csv(previous_predictions)
+    reference_predictions = pd.read_csv(reference_predictions_path)
     identity = pilot.JET_IDENTITY
-    if not test_frame[identity].reset_index(drop=True).equals(reference_test[identity]):
+    if not test_frame[identity].reset_index(drop=True).equals(reference_predictions[identity]):
         raise ValueError("The test jets differ from the saved comparison")
-    if not test_frame["label"].reset_index(drop=True).equals(reference_test["label"]):
+    if not test_frame["label"].reset_index(drop=True).equals(reference_predictions["label"]):
         raise ValueError("The test labels differ from the saved comparison")
 
     torch.set_num_threads(threads)
@@ -108,11 +111,11 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         jets, data_root, None, with_cluster_ids=architecture == CLUSTER,
     )
     if (audit["overall"]["truncated_jets"] or audit["overall"]["retained_cells"]
-            != previous["cell_extraction"]["overall"]["retained_cells"]):
+            != reference_metrics["cell_extraction"]["overall"]["retained_cells"]):
         raise ValueError("The extracted cell count differs from the saved comparison")
     print(f"Mapped {audit['mapped_jets']:,} jets and {audit['overall']['retained_cells']:,} cells", flush=True)
-    jet_features = previous["jet_features"]
-    scaling = previous["scaling_fit_on_train"]
+    jet_features = reference_metrics["jet_features"]
+    scaling = reference_metrics["scaling_fit_on_train"]
     scalars = pilot.apply_scaling(jets[jet_features].to_numpy(dtype=np.float32), cells, mask, scaling)
     cell_features = list(CELL_FEATURES)
     if cluster_ids:
@@ -130,17 +133,18 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     else:
         model_options = {}
     max_batch_cells = PARTICLE_NET_BATCH_CELLS if graph else None
-    test_scores = {name: reference_test[f"{name}_score"].to_numpy() for name in references}
-    cuts = {name: previous["thresholds_from_all_validation_jets"][name] for name in references}
-    delayed_cuts = {name: previous["thresholds_from_delayed_validation_jets"][name] for name in references}
+    test_scores = {name: reference_predictions[f"{name}_score"].to_numpy() for name in references}
+    cuts = {name: reference_metrics["thresholds_from_all_validation_jets"][name] for name in references}
+    delayed_cuts = {name: reference_metrics["thresholds_from_delayed_validation_jets"][name] for name in references}
     for name in references:
-        if not np.array_equal(test_scores[name] >= cuts[name], reference_test[f"{name}_tagged"].to_numpy()):
+        if not np.array_equal(test_scores[name] >= cuts[name], reference_predictions[f"{name}_tagged"].to_numpy()):
             raise ValueError(f"The saved predictions and threshold disagree for {name}")
-    histories = {name: previous["training"][name] for name in references}
-    generalization = {name: previous["generalization"][name] for name in references}
+    histories = {name: reference_metrics["training"][name] for name in references}
+    generalization = {name: reference_metrics["generalization"][name] for name in references}
     split_labels = {split: labels[index].numpy() for split, index in indices.items()}
     output_dir.mkdir(parents=True, exist_ok=True)
     for name in trained:
+        # Fit on training jets and select the epoch on validation jets.
         model, history = pilot.fit_network(
             name, inputs, labels, indices["train"], indices["validation"], seed=seed,
             max_epochs=settings["max_epochs"], batch_size=batch_size, patience=settings["early_stop_patience"], lengths=lengths,
@@ -153,6 +157,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
                   for split, index in indices.items()}
         validation_scores = logits["validation"].sigmoid().numpy().astype(np.float64)
         test_scores[name] = logits["test"].sigmoid().numpy().astype(np.float64)
+        # Choose both tag thresholds on validation jets before evaluating test tags.
         cuts[name], delayed_cuts[name] = pilot.validation_cuts(val_frame, validation_scores, target)
         histories[name] = history
         generalization[name] = summarize_generalization(
@@ -169,6 +174,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
 
     comparisons, results = pilot.compare_test_scores(test_frame, test_scores, cuts, delayed_cuts, seed)
     paired = _paired_changes(test_frame, test_scores, cuts, delayed_cuts, seed, references, trained)
+    # Write one row per test jet, with a score and tag from each model.
     fields = [*identity, "sample", "label", "vertex_count", "jet_time_ATLAS", "jet_pt_GeV", "jet_abs_eta"]
     predictions = test_frame[fields].copy()
     for name, score in test_scores.items():
@@ -190,7 +196,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         "scope": "Exploratory comparison on the reused test split, one unpaired run and one LLP simulation. "
                  "Unpaired is a working BIB label. The neural architectures are adapted to calorimeter cells.",
     }
-    if advanced:
+    if report_delayed_kinematics:
         delayed_predictions = predictions.assign(**{
             f"{name}_tagged": score >= delayed_cuts[name] for name, score in test_scores.items()
         })

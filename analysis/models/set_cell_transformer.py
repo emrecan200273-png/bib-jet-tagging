@@ -1,7 +1,7 @@
 """Set Transformer with two induced attention blocks and one pooling seed.
 
 Every valid cell participates, with no order or padding position as input.
-The inducing vectors are learned summaries, not selected detector cells.
+Learned queries let each block summarize the full set in eight vectors.
 """
 
 import torch
@@ -34,14 +34,14 @@ class _AttentionBlock(nn.Module):
         self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, queries, context, valid_keys=None):
-        batch, n_queries, _ = queries.shape
-        n_keys = context.shape[1]
-        query = self.query(queries).reshape(batch, n_queries, HEADS, HEAD_WIDTH).transpose(1, 2)
-        key_value = self.key_value(context).reshape(batch, n_keys, 2, HEADS, HEAD_WIDTH)
+        batch_size, query_count, _ = queries.shape
+        key_count = context.shape[1]
+        query = self.query(queries).reshape(batch_size, query_count, HEADS, HEAD_WIDTH).transpose(1, 2)
+        key_value = self.key_value(context).reshape(batch_size, key_count, 2, HEADS, HEAD_WIDTH)
         key, value = key_value.permute(2, 0, 3, 1, 4).unbind(0)
-        mask = valid_keys[:, None, None, :] if valid_keys is not None else None
-        attended = F.scaled_dot_product_attention(query, key, value, attn_mask=mask)
-        attended = attended.transpose(1, 2).reshape(batch, n_queries, WIDTH)
+        attention_mask = valid_keys[:, None, None, :] if valid_keys is not None else None
+        attended = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+        attended = attended.transpose(1, 2).reshape(batch_size, query_count, WIDTH)
         hidden = self.attention_norm(queries + self.dropout(self.output(attended)))
         return self.feedforward_norm(hidden + self.dropout(self.feedforward(hidden)))
 
@@ -55,7 +55,9 @@ class _InducedAttention(nn.Module):
         self.update = _AttentionBlock()
 
     def forward(self, cells, valid_keys):
-        summaries = self.summarize(self.inducing.expand(cells.shape[0], -1, -1), cells, valid_keys)
+        # Learned queries read all valid cells, then each cell reads the summaries.
+        inducing_queries = self.inducing.expand(cells.shape[0], -1, -1)
+        summaries = self.summarize(inducing_queries, cells, valid_keys)
         return self.update(cells, summaries)
 
 
@@ -72,15 +74,17 @@ class SetCellTransformer(nn.Module):
         self.classifier = jet_classifier(jet_dim + WIDTH)
 
     def forward(self, jets, cells, mask):
-        batch, count, _ = cells.shape
-        if count == 0:
-            pooled = jets.new_zeros((batch, WIDTH))
+        batch_size, cell_count, _ = cells.shape
+        if cell_count == 0:
+            jet_summary = jets.new_zeros((batch_size, WIDTH))
         else:
             valid = mask.bool()
-            valid_keys, empty = attention_key_mask(valid)
-            encoded = self.cell_projection(cells.masked_fill(~valid.unsqueeze(-1), 0))
+            valid_keys, empty_jets = attention_key_mask(valid)
+            cell_embeddings = self.cell_projection(cells.masked_fill(~valid.unsqueeze(-1), 0))
             for block in self.encoder:
-                encoded = block(encoded, valid_keys)
-            pooled = self.pool(self.pool_seed.expand(batch, -1, -1), encoded, valid_keys)[:, 0]
-            pooled = pooled.masked_fill(empty, 0)
-        return self.classifier(torch.cat((jets, pooled), dim=-1)).squeeze(-1)
+                cell_embeddings = block(cell_embeddings, valid_keys)
+            # One learned query pools the whole jet. Empty jets use a zero summary.
+            pool_query = self.pool_seed.expand(batch_size, -1, -1)
+            jet_summary = self.pool(pool_query, cell_embeddings, valid_keys)[:, 0]
+            jet_summary = jet_summary.masked_fill(empty_jets, 0)
+        return self.classifier(torch.cat((jets, jet_summary), dim=-1)).squeeze(-1)

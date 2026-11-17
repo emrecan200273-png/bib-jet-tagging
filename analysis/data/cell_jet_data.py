@@ -38,6 +38,7 @@ def _flatten(values):
 
 
 def _offsets(counts):
+    """Turn counts such as [2, 3] into slice boundaries [0, 2, 5]."""
     return np.concatenate((np.array([0], dtype=np.int64), np.cumsum(counts, dtype=np.int64)))
 
 
@@ -55,8 +56,8 @@ def _read_rows(tree, fields, rows, relative):
     start, stop = int(rows[0]), int(rows[-1]) + 1
     if start < 0 or stop > tree.num_entries:
         raise ValueError(f"Saved row_index is outside JetContent in {relative}")
-    arrays = tree.arrays(fields, entry_start=start, entry_stop=stop, library="ak")[rows - start]
-    return arrays, f"{relative}, rows {start}–{stop - 1}"
+    block = tree.arrays(fields, entry_start=start, entry_stop=stop, library="ak")
+    return block[rows - start], f"{relative}, rows {start}–{stop - 1}"
 
 
 def _verify_event_keys(arrays, subset, event_index, context):
@@ -72,41 +73,46 @@ def _jet_cell_offsets(arrays, cell_fields, context, *, with_cluster_ids=False):
     def lengths(field):
         return ak.to_numpy(ak.num(arrays[field], axis=1), allow_missing=False)
 
-    event_n_jets = lengths("jet_pt")
-    event_n_clusters = lengths("cluster_n_cells")
-    event_n_cells = lengths(cell_fields[0])
-    for fields, expected in ((("jet_eta", "jet_n_clusters"), event_n_jets), (cell_fields, event_n_cells)):
+    jets_per_event = lengths("jet_pt")
+    clusters_per_event = lengths("cluster_n_cells")
+    cells_per_event = lengths(cell_fields[0])
+    for fields, expected in ((("jet_eta", "jet_n_clusters"), jets_per_event), (cell_fields, cells_per_event)):
         for field in fields:
             if not np.array_equal(lengths(field), expected):
                 raise ValueError(f"Unaligned {field} vectors: {context}")
 
-    jet_n_clusters = _int_vector(_flatten(arrays["jet_n_clusters"]), "jet_n_clusters", context)
-    cluster_n_cells = _int_vector(_flatten(arrays["cluster_n_cells"]), "cluster_n_cells", context)
-    event_jet_offsets = _offsets(event_n_jets)
-    event_cluster_offsets = _offsets(event_n_clusters)
-    jet_cluster_offsets = _offsets(jet_n_clusters)
-    cluster_cell_offsets = _offsets(cluster_n_cells)
-    if not np.array_equal(jet_cluster_offsets[event_jet_offsets], event_cluster_offsets):
+    clusters_per_jet = _int_vector(_flatten(arrays["jet_n_clusters"]), "jet_n_clusters", context)
+    cells_per_cluster = _int_vector(_flatten(arrays["cluster_n_cells"]), "cluster_n_cells", context)
+    # Each event stores its jets, each jet its clusters, and each cluster its cells in order.
+    first_jet_of_event = _offsets(jets_per_event)
+    first_cluster_of_event = _offsets(clusters_per_event)
+    first_cluster_of_jet = _offsets(clusters_per_jet)
+    first_cell_of_cluster = _offsets(cells_per_cluster)
+    if not np.array_equal(first_cluster_of_jet[first_jet_of_event], first_cluster_of_event):
         raise ValueError(f"sum(jet_n_clusters) does not match the cluster count: {context}")
-    if not np.array_equal(cluster_cell_offsets[event_cluster_offsets], _offsets(event_n_cells)):
+    first_cell_of_event = _offsets(cells_per_event)
+    if not np.array_equal(first_cell_of_cluster[first_cluster_of_event], first_cell_of_event):
         raise ValueError(f"sum(cluster_n_cells) does not match the cell count: {context}")
-    owners = (np.repeat(np.arange(len(cluster_n_cells), dtype=np.int32), cluster_n_cells)
-              if with_cluster_ids else None)
-    return event_n_jets, event_jet_offsets, cluster_cell_offsets[jet_cluster_offsets], owners
+    first_cell_of_jet = first_cell_of_cluster[first_cluster_of_jet]
+    cluster_of_cell = None
+    if with_cluster_ids:
+        cluster_indices = np.arange(len(cells_per_cluster), dtype=np.int32)
+        cluster_of_cell = np.repeat(cluster_indices, cells_per_cluster)
+    return jets_per_event, first_jet_of_event, first_cell_of_jet, cluster_of_cell
 
 
-def _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context):
-    jet_indices = _int_vector(subset["jet_index"].to_numpy(), "jet_index", context)
-    if np.any(jet_indices >= event_n_jets[event_index]):
+def _selected_jet_indices(arrays, subset, event_index, jets_per_event, first_jet_of_event, context):
+    index_within_event = _int_vector(subset["jet_index"].to_numpy(), "jet_index", context)
+    if np.any(index_within_event >= jets_per_event[event_index]):
         raise ValueError(f"Saved jet_index is outside the ROOT jet vector: {context}")
-    jet_indices = event_jet_offsets[event_index] + jet_indices.astype(np.int64, copy=False)
+    jet_indices = first_jet_of_event[event_index] + index_within_event.astype(np.int64, copy=False)
     comparisons = [("jet_eta", "jet_eta", 1.0)]
     if "jet_pt_GeV" in subset.columns:
         comparisons.append(("jet_pt_GeV", "jet_pt", 0.001))
     for saved, field, scale in comparisons:
         root_values = _flatten(arrays[field])[jet_indices] * scale
-        if (not np.isfinite(root_values).all() or np.any(root_values == INVALID_CELL * scale)
-                or not np.allclose(subset[saved].to_numpy(dtype=float), root_values, rtol=1e-9, atol=1e-8)):
+        valid_root = np.isfinite(root_values).all() and not np.any(root_values == INVALID_CELL * scale)
+        if not valid_root or not np.allclose(subset[saved].to_numpy(dtype=float), root_values, rtol=1e-9, atol=1e-8):
             raise ValueError(f"Saved {saved} disagrees with the ROOT jet at jet_index: {context}")
     return jet_indices
 
@@ -116,43 +122,45 @@ def read_jet_cell_spans(tree, subset, relative, *, cell_fields=CELL_BRANCHES, wi
     rows, event_index = np.unique(subset["row_index"].to_numpy(), return_inverse=True)
     arrays, context = _read_rows(tree, (*JET_CELL_KEYS, *cell_fields), rows, relative)
     _verify_event_keys(arrays, subset, event_index, context)
-    event_n_jets, event_jet_offsets, offsets, owners = _jet_cell_offsets(
+    jets_per_event, first_jet_of_event, first_cell_of_jet, cluster_of_cell = _jet_cell_offsets(
         arrays, cell_fields, context, with_cluster_ids=with_cluster_ids,
     )
-    jets = _selected_jet_indices(arrays, subset, event_index, event_n_jets, event_jet_offsets, context)
+    jets = _selected_jet_indices(arrays, subset, event_index, jets_per_event, first_jet_of_event, context)
     fields = np.column_stack([_flatten(arrays[field]) for field in cell_fields])
-    spans = np.column_stack((offsets[jets], offsets[jets + 1]))
-    return (fields, spans, owners) if with_cluster_ids else (fields, spans)
+    spans = np.column_stack((first_cell_of_jet[jets], first_cell_of_jet[jets + 1]))
+    return (fields, spans, cluster_of_cell) if with_cluster_ids else (fields, spans)
 
 
 def _read_chunk(tree, subset, relative, max_cells, with_cluster_ids):
     payload = read_jet_cell_spans(tree, subset, relative, with_cluster_ids=with_cluster_ids)
     flat_cells, spans = payload[:2]
-    owners = payload[2] if with_cluster_ids else None
-    for i, (lo, hi) in zip(subset.index, spans, strict=True):
-        row = flat_cells[lo:hi]
-        keep = np.isfinite(row).all(axis=1) & (row != INVALID_CELL).all(axis=1) & (row[:, 0] > 0)
-        row = row[keep]
-        if not len(row):
-            yield i, hi - lo, 0, np.nan, None, None
+    cluster_of_cell = payload[2] if with_cluster_ids else None
+    for i, (start, stop) in zip(subset.index, spans, strict=True):
+        jet_cells = flat_cells[start:stop]
+        valid = np.isfinite(jet_cells).all(axis=1) & (jet_cells != INVALID_CELL).all(axis=1)
+        valid &= jet_cells[:, 0] > 0
+        valid_cells = jet_cells[valid]
+        if not len(valid_cells):
+            yield i, len(jet_cells), 0, np.nan, None, None
             continue
 
-        energies = row[:, 0].astype(np.float64, copy=False)
+        energies = valid_cells[:, 0].astype(np.float64, copy=False)
         total_energy = energies.sum()
         if not np.isfinite(total_energy):
             raise ValueError(f"Nonfinite energy sum for jet table row {i}: {relative}")
         top = np.argsort(-energies, kind="stable")[:max_cells]
-        e, t, x, y, z, d_eta, d_phi = row[top].T
+        e, t, x, y, z, d_eta, d_phi = valid_cells[top].T
         e_fraction = e / total_energy
         features = np.column_stack((t, np.log1p(100.0 * e_fraction), np.hypot(x, y) / 1000.0,
                                     z / 1000.0, d_eta, d_phi)).astype(np.float32)
         if not np.isfinite(features).all():
             raise ValueError(f"Nonfinite cell features for jet table row {i}: {relative}")
         local_ids = None
-        if owners is not None:
-            _, local_ids = np.unique(owners[lo:hi][keep][top], return_inverse=True)
+        if cluster_of_cell is not None:
+            cluster_ids = cluster_of_cell[start:stop][valid][top]
+            _, local_ids = np.unique(cluster_ids, return_inverse=True)
             local_ids = local_ids.astype(np.int32, copy=False)
-        yield i, hi - lo, len(row), e_fraction.sum(), features, local_ids
+        yield i, len(jet_cells), len(valid_cells), e_fraction.sum(), features, local_ids
 
 
 def _quantiles(values):

@@ -11,7 +11,9 @@ import uproot
 
 from analysis.data.cell_jet_data import CELL_BRANCHES, EVENTS_PER_CHUNK, _read_rows
 from analysis.data.match_unpaired_vertices import match, scalar_array
-from analysis.data.xgb_data import JET_BRANCHES, PHYSICS_FEATURES, apply_jet_cuts, read_jet_fields, selected_jet_frame
+from analysis.data.xgb_data import (
+    JET_BRANCHES, PHYSICS_FEATURES, apply_jet_cuts, read_jet_fields, selected_jet_frame,
+)
 
 
 CELL_KEYS = ("runNumber", "eventNumber", "lumiBlock")
@@ -32,37 +34,40 @@ CUT_STAGES = (
 
 def _jet_chunks(tree, selected, source, cutflow):
     """Read the small ranges covering the chosen rows, in source order."""
-    for _, rows in groupby(selected, key=lambda item: item[0] // EVENTS_PER_CHUNK):
-        bucket = list(rows)
-        row_numbers = np.fromiter((entry for entry, _ in bucket), dtype=np.int64)
-        arrays, ctx = _read_rows(tree, (*CELL_KEYS, *JET_BRANCHES), row_numbers, source)
-        ids = [scalar_array(arrays[key], key, ctx, integer=True) for key in CELL_KEYS]
-        for (_, expected), actual in zip(bucket, zip(*ids), strict=True):
-            if any(np.ma.is_masked(value) for value in actual) or tuple(map(int, actual)) != expected:
-                raise ValueError(f"ROOT event key differs from the vertex join: {ctx}")
+    for _, block in groupby(selected, key=lambda item: item[0] // EVENTS_PER_CHUNK):
+        entries_and_keys = list(block)
+        row_numbers = np.fromiter((entry for entry, _ in entries_and_keys), dtype=np.int64)
+        arrays, context = _read_rows(tree, (*CELL_KEYS, *JET_BRANCHES), row_numbers, source)
+        id_columns = [scalar_array(arrays[key], key, context, integer=True) for key in CELL_KEYS]
+        root_event_keys = zip(*id_columns)
+        for (_, joined_key), root_key in zip(entries_and_keys, root_event_keys, strict=True):
+            missing_id = any(np.ma.is_masked(value) for value in root_key)
+            if missing_id or tuple(map(int, root_key)) != joined_key:
+                raise ValueError(f"ROOT event key differs from the vertex join: {context}")
 
         jet_counts = ak.to_numpy(ak.num(arrays["jet_pt"], axis=1), allow_missing=False)
         n_jets = int(jet_counts.sum())
-        clean = read_jet_fields(arrays, jet_counts, ctx)
+        clean = read_jet_fields(arrays, jet_counts, context)
         cutflow[CUT_STAGES[0]] += n_jets
         keep = np.ones(n_jets, dtype=bool)
         pt = apply_jet_cuts(clean, keep, cutflow, min_pt_GeV=MIN_PT_GEV, max_abs_eta=MAX_ABS_ETA, require_mixed=True)
-        keep &= np.logical_and.reduce([np.isfinite(clean[field]) for field in PHYSICS_FEATURES])
+        for field in PHYSICS_FEATURES:
+            keep &= np.isfinite(clean[field])
         cutflow["finite_standard_features"] += int(keep.sum())
 
         if keep.any():
-            event_groups = [f"unpaired:{run}:{event}" for _, (run, event, _) in bucket]
+            event_groups = [f"unpaired:{run}:{event}" for _, (run, event, _) in entries_and_keys]
             yield selected_jet_frame(clean, pt, keep, jet_counts, row_numbers, event_groups, source,
                                      sample="unpaired", label=1, split="test")
 
 
 def _select_run(records, run):
-    run_status = Counter(dict.fromkeys(("matched_zero", "matched_nonzero", "unmatched", "invalid_vertex_count",
-                                       "invalid_cell_key"), 0))
+    statuses = ("matched_zero", "matched_nonzero", "unmatched", "invalid_vertex_count", "invalid_cell_key")
+    run_status = Counter(dict.fromkeys(statuses, 0))
     selected = defaultdict(list)
     seen_events = set()
-    for source, entry, r, event, lumi, vertices, status, _, _ in records:
-        if r != run:
+    for source, entry, run_number, event, lumi, vertices, status, _, _ in records:
+        if run_number != run:
             continue
         if status == "matched":
             status = "matched_zero" if vertices == 0 else "matched_nonzero"
@@ -72,7 +77,7 @@ def _select_run(records, run):
                 raise ValueError(f"Run {run} repeats event {event}; the run:event identity is ambiguous")
             seen_events.add(event)
         if status == "matched_zero":
-            selected[source].append((entry, (r, event, lumi)))
+            selected[source].append((entry, (run_number, event, lumi)))
     return selected, run_status
 
 
@@ -104,9 +109,12 @@ def load_external_jets(cell_dir, vertex_dir, run, *, vertex_event_int32_bits=Fal
                 raise ValueError(f"Missing required jet/cell branches in {source}: {sorted(missing)}")
             parts.extend(_jet_chunks(tree, entries, source, cutflow))
 
-    frame = (pd.concat(parts, ignore_index=True) if parts else
-             pd.DataFrame({name: pd.Series(dtype=dtype) for name, dtype in JET_COLUMNS.items()}))
-    if len(frame) != cutflow["finite_standard_features"] or frame.duplicated(["event_group", "jet_index"]).any():
+    if parts:
+        frame = pd.concat(parts, ignore_index=True)
+    else:
+        frame = pd.DataFrame({name: pd.Series(dtype=dtype) for name, dtype in JET_COLUMNS.items()})
+    wrong_jet_count = len(frame) != cutflow["finite_standard_features"]
+    if wrong_jet_count or frame.duplicated(["event_group", "jet_index"]).any():
         raise RuntimeError("Output jet counts or identities disagree with the extraction")
     n_events = sum(run_status.values())
     if not n_events:
