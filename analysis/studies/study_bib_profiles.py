@@ -5,16 +5,17 @@ import hashlib
 import json
 from pathlib import Path
 
+from analysis import PROJECT_ROOT
+
 import numpy as np
 import pandas as pd
 import uproot
-from sklearn.metrics import roc_auc_score
 
-from cell_jet_data import EVENTS_PER_CHUNK, INVALID_CELL, _source_path, read_jet_cell_spans
-from data_paths import resolve_data_paths
-from train_xgboost_vertex import load_jets
-from xgb_evaluation import choose_threshold, jet_time_regions, weighted_cut
-from xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
+from analysis.data.cell_jet_data import EVENTS_PER_CHUNK, INVALID_CELL, _source_path, read_jet_cell_spans
+from analysis.data.data_paths import resolve_data_paths
+from analysis.training.train_xgboost_vertex import load_jets
+from analysis.evaluation.xgb_evaluation import choose_threshold, jet_time_regions, rates, weighted_cut
+from analysis.evaluation.xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
 
 
 C_MM_PER_NS = 299.792458
@@ -106,18 +107,12 @@ def _attach_scores(jets, data_root, manifest):
 
 
 def _evaluate(frame, name, cut, weights):
-    present = weights > 0
-    weights = weights[present]
-    labels = frame["label"].to_numpy()[present]
-    score = frame[name].to_numpy()[present]
-    tags = score >= cut
-    result = {"roc_auc": float(roc_auc_score(labels, score, sample_weight=weights))
-              if len(np.unique(labels)) == 2 else None}
-    for sample, label, decisions in (("llp_kept", 0, ~tags), ("unpaired_tagged", 1, tags)):
-        sel = labels == label
-        result[f"{sample}_total"] = int(sel.sum())
-        result[f"{sample}_successes"] = int(decisions[sel].sum())
-        result[f"{sample}_fraction"] = float(np.average(decisions[sel], weights=weights[sel])) if sel.any() else None
+    summary = rates(frame, frame[name].to_numpy(), cut, weights)
+    result = {"roc_auc": summary["auc"]}
+    for sample in ("llp_kept", "unpaired_tagged"):
+        result[f"{sample}_total"] = summary[sample]["total"]
+        result[f"{sample}_successes"] = summary[sample]["count"]
+        result[f"{sample}_fraction"] = summary[sample]["rate"]
     return result
 
 
@@ -160,17 +155,19 @@ def run_study(project_root):
     results = []
     cuts = {}
     for mode in ("raw", "shared_kinematics"):
-        weights = overlap_weights(validation, support) if mode == "shared_kinematics" else np.ones(len(validation))
+        shared = mode == "shared_kinematics"
+        weights = overlap_weights(validation, support) if shared else np.ones(len(validation))
+        test_weights = {region: overlap_weights(subset, support) if shared else np.ones(len(subset))
+                        for region, subset in test_regions.items()}
         cuts[mode] = {}
         for model in SCORES:
             score = validation[model].to_numpy()
-            cut = (weighted_cut(validation, score, weights, TARGET) if mode == "shared_kinematics"
+            cut = (weighted_cut(validation, score, weights, TARGET) if shared
                    else choose_threshold(validation["label"], score, TARGET))
             cuts[mode][model] = {"value": cut, **_evaluate(validation, model, cut, weights)}
             for region, subset in test_regions.items():
-                test_weights = overlap_weights(subset, support) if mode == "shared_kinematics" else np.ones(len(subset))
                 results.append({"region": region, "population": mode, "score": model,
-                                "delayed_validation_threshold": cut, **_evaluate(subset, model, cut, test_weights)})
+                                "delayed_validation_threshold": cut, **_evaluate(subset, model, cut, test_weights[region])})
 
     report = {
         "scope": ("Exploratory jet-level comparison using the locked XGBoost event splits, LLP simulation, "
@@ -216,6 +213,6 @@ def run_study(project_root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     args = parser.parse_args()
     print(f"Saved profile comparisons in {run_study(args.project_root)}")

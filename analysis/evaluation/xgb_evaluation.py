@@ -201,6 +201,17 @@ def evaluate_scores(frame, scores, threshold, *, bootstrap_repeats=200, seed=42)
     }
 
 
+def comparison_rows(region, model, metrics):
+    """Yield the two working-point rows shared by the model comparison tables."""
+    fields = (("unpaired_tagged", "BIB_tagged_BIB", "BIB", "bib_tag_fraction"),
+              ("llp_kept", "LLP_kept_as_LLP", "LLP", "llp_keep_fraction"))
+    for metric, count, sample, fraction in fields:
+        low, high = metrics[f"{fraction}_ci95"] or (None, None)
+        yield {"region": region, "model": model, "metric": metric,
+               "successes": metrics["confusion"][count], "total": metrics["class_counts"][sample],
+               "fraction": metrics[fraction], "ci95_low": low, "ci95_high": high}
+
+
 def _save(fig, output_dir, name):
     path = output_dir / f"{name}.png"
     fig.savefig(path, dpi=170, bbox_inches="tight", facecolor="white")

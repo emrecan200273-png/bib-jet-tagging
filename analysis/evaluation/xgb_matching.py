@@ -91,12 +91,14 @@ def match_kinematics(frame, *, seed=42):
     if "row_index" in frame.columns:
         sort_keys.append("row_index")
     work = add_kinematic_bins(frame.sort_values(sort_keys, kind="stable").reset_index(drop=True))
-    in_range = work["pt_bin"].ge(0) & work["eta_bin"].ge(0)
+    in_range = work[BIN_COLUMNS].ge(0).all(axis=1).to_numpy()
     supported = supported_kinematic_bins(work.loc[work["split"].eq("train")])
     if not supported:
         raise ValueError("No training bin contains at least three jets of each class")
     work_bins = list(zip(work["pt_bin"], work["eta_bin"]))
     supported_mask = np.fromiter((key in supported for key in work_bins), dtype=bool, count=len(work))
+    # Positions in each group follow the stable row order used for sampling.
+    by_bin = work.groupby(["split", *BIN_COLUMNS, "label"], observed=True, sort=False).indices
     # Separate reproducible random streams keep one split's draw independent of
     # the numbers or row order in the other splits.
     streams = np.random.SeedSequence(seed).spawn(len(SPLITS))
@@ -104,25 +106,21 @@ def match_kinematics(frame, *, seed=42):
     for split, stream in zip(SPLITS, streams):
         rng = np.random.default_rng(stream)
         is_split = work["split"].eq(split).to_numpy()
-        selected_per_class = {0: 0, 1: 0}
+        selected_count = 0
         for pt_bin, eta_bin in sorted(supported):
-            in_bin = is_split & work["pt_bin"].eq(pt_bin).to_numpy() & work["eta_bin"].eq(eta_bin).to_numpy()
-            class_indices = {
-                label: np.flatnonzero(in_bin & work["label"].eq(label).to_numpy())
-                for label in (0, 1)
-            }
-            pairs = min(len(class_indices[0]), len(class_indices[1]))
-            for label in (0, 1):
-                if pairs:
-                    selected_indices.extend(rng.choice(class_indices[label], size=pairs, replace=False).tolist())
-                selected_per_class[label] += pairs
+            classes = [by_bin.get((split, pt_bin, eta_bin, label), ()) for label in (0, 1)]
+            pairs = min(map(len, classes))
+            if pairs:
+                for positions in classes:
+                    selected_indices.extend(rng.choice(positions, size=pairs, replace=False).tolist())
+            selected_count += pairs
             bin_records.append({
                 "split": split, "pt_bin": pt_bin, "eta_bin": eta_bin,
                 "pt_low_GeV": float(PT_EDGES_GEV[pt_bin]),
                 "pt_high_GeV": float(PT_EDGES_GEV[pt_bin + 1]),
                 "abs_eta_low": float(ABS_ETA_EDGES[eta_bin]),
                 "abs_eta_high": float(ABS_ETA_EDGES[eta_bin + 1]),
-                "input_LLP": len(class_indices[0]), "input_unpaired": len(class_indices[1]),
+                "input_LLP": len(classes[0]), "input_unpaired": len(classes[1]),
                 "selected_LLP": pairs, "selected_unpaired": pairs, "pairs": pairs,
             })
         for label, name in [(0, "LLP"), (1, "unpaired")]:
@@ -131,15 +129,15 @@ def match_kinematics(frame, *, seed=42):
             split_records.append({
                 "split": split, "sample": name, "label": label,
                 "input_jets": int(rows.sum()),
-                "excluded_out_of_range": int(np.count_nonzero(rows & ~in_range.to_numpy())),
-                "excluded_unsupported": int(np.count_nonzero(rows & in_range.to_numpy() & ~supported_mask)),
+                "excluded_out_of_range": int(np.count_nonzero(rows & ~in_range)),
+                "excluded_unsupported": int(np.count_nonzero(rows & in_range & ~supported_mask)),
                 "supported_input_jets": supported_count,
-                "excluded_class_excess": supported_count - selected_per_class[label],
-                "selected_jets": selected_per_class[label],
+                "excluded_class_excess": supported_count - selected_count,
+                "selected_jets": selected_count,
             })
-        if split in ("validation", "test") and min(selected_per_class.values()) < MIN_HELD_OUT_JETS_PER_CLASS:
+        if split != "train" and selected_count < MIN_HELD_OUT_JETS_PER_CLASS:
             raise ValueError(
-                f"Kinematic matching leaves too few {split} jets: {selected_per_class}; "
+                f"Kinematic matching leaves too few {split} jets: {dict.fromkeys((0, 1), selected_count)}; "
                 f"need at least {MIN_HELD_OUT_JETS_PER_CLASS} per class"
             )
 

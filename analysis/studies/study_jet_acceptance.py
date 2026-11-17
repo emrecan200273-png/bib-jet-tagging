@@ -4,14 +4,16 @@ import argparse
 import json
 from pathlib import Path
 
+from analysis import PROJECT_ROOT
+
 import numpy as np
 import pandas as pd
 
-from train_xgboost import balanced_weights, fit_booster, predict_model, score_saved_model, write_json
-from train_xgboost_vertex import JET_ID, load_jets, paired_interval, population
-from xgb_data import PHYSICS_FEATURES, prepare_training_data, preserve_splits, tile_fraction_mask
-from xgb_evaluation import choose_threshold, jet_time_regions, rates, weighted_cut
-from xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
+from analysis.training.train_xgboost import balanced_weights, fit_booster, predict_model, score_saved_model, write_json
+from analysis.training.train_xgboost_vertex import JET_ID, load_jets, paired_interval, population
+from analysis.data.xgb_data import PHYSICS_FEATURES, prepare_training_data, preserve_splits, tile_fraction_mask
+from analysis.evaluation.xgb_evaluation import choose_threshold, jet_time_regions, rates, weighted_cut
+from analysis.evaluation.xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
 
 
 def run_study(project_root):
@@ -43,10 +45,9 @@ def run_study(project_root):
     fixed_val = val["original"].to_numpy()
     fixed_test = test["original"].to_numpy()
     time_regions = jet_time_regions(test)
-    delayed, near_delayed = (time_regions[name] for name in ("delayed", "3_to_10_ns"))
-    extended_test = {"all_pilot_test": fixed_test, "delayed_pilot_test": fixed_test & delayed,
-                     "3_to_10_ns_pilot_test": fixed_test & near_delayed, "all_expanded_test": time_regions["all"],
-                     "delayed_expanded_test": delayed}
+    original_regions = {name: fixed_test & mask for name, mask in time_regions.items()}
+    extended_test = {f"{name}_pilot_test": mask for name, mask in original_regions.items()}
+    extended_test.update(all_expanded_test=time_regions["all"], delayed_expanded_test=time_regions["delayed"])
     features = list(PHYSICS_FEATURES)
     time_features = ["jet_time_ATLAS", "jet_time_spread"]
     selections = [("15_gev_mixed", "mixed", features, False), ("15_gev_all_calorimeters", None, features, False),
@@ -92,7 +93,8 @@ def run_study(project_root):
         report["comparisons"][name] = {key: rates(test.loc[mask], score[mask], cuts[name])
                                        for key, mask in extended_test.items()}
         report["common_kinematics"][name] = {}
-        for key, mask in [("all", fixed_test), ("delayed", fixed_test & delayed)]:
+        for key in ("all", "delayed"):
+            mask = original_regions[key]
             sample = test.loc[mask]
             weights = overlap_weights(sample, support)
             report["common_kinematics"][name][key] = rates(sample, score[mask], shared_cuts[name], weights)
@@ -101,8 +103,7 @@ def run_study(project_root):
                 key: {metric: paired_interval(original_test.loc[mask], {n: s[mask] for n, s in original_scores.items()},
                                               cuts, label, seed, model_names=("reference", name))
                       for metric, label in [("llp_kept", 0), ("unpaired_tagged", 1)]}
-                for key, mask in [("all", np.ones(len(original_test), dtype=bool)),
-                                  ("delayed", delayed[fixed_test]), ("3_to_10_ns", near_delayed[fixed_test])]
+                for key, mask in ((key, subset[fixed_test]) for key, subset in original_regions.items())
             }
     report["selected_jet_counts"] = {
         name: population(frame)
@@ -115,5 +116,5 @@ def run_study(project_root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     run_study(parser.parse_args().project_root)

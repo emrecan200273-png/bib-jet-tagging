@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from cell_models import jet_classifier
+from analysis.models.cell_models import jet_classifier
 
 
 WIDTH = 32

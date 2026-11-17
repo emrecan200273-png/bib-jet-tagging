@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import uproot
 
-from data_paths import resolve_data_paths
+from analysis.data.data_paths import resolve_data_paths
 
 
 GROUPS = {
@@ -224,36 +224,23 @@ def summarize_pilot(jets, rows, cells, examples, inventory, output_dir):
 
 
 def meeting_notes(summary, output_dir):
-    totals = ", ".join(f"{g['sample']}: {g['total_entries']:,} tree entries" for g in summary["source_group_summary"])
-    executed_date = datetime.fromisoformat(summary["created_utc"]).astimezone(ZoneInfo("Europe/Stockholm")).strftime("%d %B %Y")
-    lines = ["# First data look — meeting notes", "", f"Executed on the downloaded data, {executed_date}.", "",
-             "## What was checked", "",
-             totals + ". The pilot reads leading rows from every file, retaining stored units and all jets.", "",
-             "| Sample | Files read | Rows read | Jets | Repeated recorded event keys |",
-             "|---|---:|---:|---:|---:|"]
-    for group in summary["groups"]:
-        lines.append(f"| {group['sample']} | {group['files_read']} | {group['rows_read']} | {group['jets']} | {group['repeated_event_keys']} |")
-    failures = sum(v for group in summary["groups"] for k, v in group.items() if k.endswith("_failures"))
-    lines += ["", f"Vector lengths and jet/cluster/cell count sums were checked in every pilot row: **{failures} failed checks**. These checks do not establish the producer's cell-to-jet ordering.", "",
-              "The three figures compare kinematics, reconstructed jet time/spread, and all stored cells in one deterministic row from each source. Relative source counts are not physical rates. No training, class labels or rejection performance are claimed.", "",
-              "## Concrete findings", ""]
-    for group in summary["groups"]:
-        if group["truth_match_flag_available_jets"]:
-            lines.append(f"- {group['sample']}: only {group['truth_match_flag_equals_one']:,} of {group['truth_match_flag_available_jets']:,} jets have `jet_is_llp_matched == 1`. The flag definition needs confirmation; all jets were retained in the comparisons.")
-    for value in summary["jet_value_quality"]:
-        if value["branch"] == "jet_BIB_score":
-            lines.append(f"- {value['sample']}: {value['minus_999999']:,} `jet_BIB_score` values equal finite `-999999`. This looks like a sentinel and needs its documented meaning; a finite-value filter would retain it.")
-    for example in summary["examples"]:
-        lines.append(f"- The timing-blind {example['sample']} cell example has {example['cell_count']:,} cells across a row containing {example['jet_count']} jets. It is a decoded example, not a representative or truth-labeled pattern.")
-    lines += ["- The jet kinematic distributions differ between the sources. Compare selections and MC/data production before interpreting separation.", "",
-              "## Questions for Emil", "",
-              "1. Which selection defines BIB in the unpaired sample, and what contamination remains? Which LLP truth-matching flag/value should define signal jets?",
-              "2. What are the energy, position and time units? What ToF correction, calibration and invalid-value conventions were applied?",
-              "3. How are cells linked to clusters and jets? Does ordered slicing using `jet_n_clusters` and `cluster_n_cells` reproduce the production code?",
-              "4. What triggers, energy/quality thresholds and weights were used? How should the different MC/data productions and overlapping sample versions be compared?",
-              "5. What defines a unique physical event across files/productions, and what does the direction/range of `jet_BIB_score` mean?", "",
-              "## Next decision", "",
-              "After those definitions are checked, construct a comparable jet-level feature table and an event-grouped train/validation/test split. Compare a small XGBoost baseline with the existing tagger, while keeping truth fields, identifiers and existing tagger outputs out of the initial model inputs.", ""]
+    timestamp = datetime.fromisoformat(summary["created_utc"])
+    date = timestamp.astimezone(ZoneInfo("Europe/Stockholm")).strftime("%d %B %Y")
+    lines = [
+        "# First data look", "", f"Run on {date}. The pilot reads the first rows of each file in stored units.", "",
+        "| Sample | Files | Rows | Jets | Repeated event keys |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for g in summary["groups"]:
+        lines.append(f"| {g['sample']} | {g['files_read']} | {g['rows_read']} | "
+                     f"{g['jets']} | {g['repeated_event_keys']} |")
+    failures = sum(value for group in summary["groups"] for key, value in group.items() if key.endswith("_failures"))
+    lines += ["", f"Failed vector and count checks: **{failures}**.",
+              "The plots show jet kinematics and timing, plus cells from the first row with cells in each sample.", ""]
+    for item in summary["jet_value_quality"]:
+        if item["branch"] == "jet_BIB_score":
+            lines.append(f"- {item['sample']}: {item['minus_999999']:,} BIB score entries contain the sentinel -999999.")
+    lines += ["", "See pilot_summary.json for the full counters and the two decoded examples.", ""]
     path = Path(output_dir) / "meeting_notes.md"
     path.write_text("\n".join(lines))
     return path

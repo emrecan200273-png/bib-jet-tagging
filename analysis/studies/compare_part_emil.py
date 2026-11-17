@@ -4,14 +4,16 @@ import argparse
 import json
 from pathlib import Path
 
+from analysis import PROJECT_ROOT
+
 # Import the neural trainer first so its PyTorch setup precedes XGBoost imports.
-from train_cell_models import apply_scaling, predict_logits, torch
-from cell_jet_data import CELL_FEATURES, extract_cells
-from cell_models import restore_model
-from data_paths import resolve_data_paths
-from train_xgboost import write_json
-from train_xgboost_vertex import kinematic_comparison, load_jets, paired_interval
-from xgb_evaluation import evaluate_scores, jet_time_regions
+from analysis.training.train_cell_models import apply_scaling, predict_logits, torch
+from analysis.data.cell_jet_data import CELL_FEATURES, extract_cells
+from analysis.models.cell_models import restore_model
+from analysis.data.data_paths import resolve_data_paths
+from analysis.training.train_xgboost import write_json
+from analysis.training.train_xgboost_vertex import kinematic_comparison, load_jets, paired_interval
+from analysis.evaluation.xgb_evaluation import evaluate_scores, jet_time_regions
 import numpy as np
 import pandas as pd
 
@@ -81,7 +83,7 @@ def run_comparison(root, cell_dir=None, vertex_dir=None, run=None, *, vertex_eve
     sample = control
     input_audit = None
     if cell_dir is not None:
-        from external_tagging_jets import load_external_jets
+        from analysis.data.external_tagging_jets import load_external_jets
 
         if old["event_group"].str.startswith(f"unpaired:{run}:").any():
             raise ValueError(f"Run {run} is part of the original dataset; use the original test mode")
@@ -139,7 +141,7 @@ def run_comparison(root, cell_dir=None, vertex_dir=None, run=None, *, vertex_eve
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--cell-dir", type=Path, help="JetContent ROOT files for the external run")
     parser.add_argument("--vertex-dir", type=Path, help="BIB ROOT files with nPrimaryVertices")
     parser.add_argument("--run", type=int, help="Requested run number for the external sample")

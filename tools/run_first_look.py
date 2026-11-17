@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import time
 
-ANALYSIS = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parents[1]
+ANALYSIS = PROJECT / "analysis"
+NOTEBOOK_DIR = PROJECT / "notebooks"
 NOTEBOOKS = (
     "01_remote_data_inventory.ipynb",
     "02_first_data_look.ipynb",
@@ -24,10 +26,10 @@ def run_notebook(name):
     import nbformat
     from nbclient import NotebookClient
 
-    path = ANALYSIS / name
+    path = NOTEBOOK_DIR / name
     notebook = nbformat.read(path, as_version=4)
     client = NotebookClient(notebook, timeout=240, kernel_name="ppp-first-look",
-                            resources={"metadata": {"path": str(ANALYSIS)}})
+                            resources={"metadata": {"path": str(NOTEBOOK_DIR)}})
     started = time.monotonic()
     try:
         client.execute()

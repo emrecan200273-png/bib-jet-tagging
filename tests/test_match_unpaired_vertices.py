@@ -11,8 +11,8 @@ import unittest
 import numpy as np
 import uproot
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "analysis"))
-from match_unpaired_vertices import match, write_outputs
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from analysis.data.match_unpaired_vertices import match, write_outputs
 
 
 class MatchVertexTests(unittest.TestCase):

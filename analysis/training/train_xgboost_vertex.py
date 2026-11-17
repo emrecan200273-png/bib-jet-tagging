@@ -6,15 +6,17 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 
-from train_xgboost import (
+from analysis import PROJECT_ROOT
+
+from analysis.training.train_xgboost import (
     MODEL_FEATURES, balanced_weights, fit_booster, predict_model, score_saved_model, write_json,
 )
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores
-from xgb_matching import ABS_ETA_EDGES, BIN_COLUMNS, PT_EDGES_GEV, add_kinematic_bins, supported_kinematic_bins
+from analysis.evaluation.xgb_evaluation import DELAYED_TIME_NS, choose_threshold, comparison_rows, evaluate_scores
+from analysis.evaluation.xgb_matching import ABS_ETA_EDGES, BIN_COLUMNS, PT_EDGES_GEV, add_kinematic_bins, supported_kinematic_bins
 
 
 MODEL_NAMES = ("baseline", "zero_vertex")
@@ -213,18 +215,9 @@ def run_study(baseline_dir, vertex_path, output_dir):
         predictions[f"{name}_score"] = score
         predictions[f"{name}_tagged"] = score >= thresholds[name]
     bins, kinematic = kinematic_comparison(train, predictions)
-    results = []
-    for region, comparison in comparisons.items():
-        for name, values in comparison["models"].items():
-            for metric, count, denominator, rate in [
-                ("unpaired_tagged", "BIB_tagged_BIB", "BIB", "bib_tag_fraction"),
-                ("llp_kept", "LLP_kept_as_LLP", "LLP", "llp_keep_fraction"),
-            ]:
-                low, high = values[f"{rate}_ci95"] or (None, None)
-                results.append({"region": region, "model": name, "metric": metric,
-                                "successes": values["confusion"][count], "total": values["class_counts"][denominator],
-                                "fraction": values[rate], "ci95_low": low, "ci95_high": high})
-    results = pd.DataFrame(results)
+    results = pd.DataFrame(row for region, comparison in comparisons.items()
+                           for name, metrics in comparison["models"].items()
+                           for row in comparison_rows(region, name, metrics))
     inputs = [jet_path, vertex_path, baseline_dir / "xgboost.ubj", baseline_dir / "metrics.json",
               baseline_dir / "feature_schema.json"]
     fingerprints = {}
@@ -265,7 +258,7 @@ def run_study(baseline_dir, vertex_path, output_dir):
 
 
 def main():
-    outputs = Path(__file__).resolve().parent / "outputs"
+    outputs = PROJECT_ROOT / "analysis/outputs"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-dir", type=Path, default=outputs / "xgboost_baseline")
     parser.add_argument("--vertex-mapping", type=Path, default=outputs / "unpaired_vertex_match/event_mapping.csv.gz")

@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 import uproot
 
-from cell_jet_data import CELL_BRANCHES, EVENTS_PER_CHUNK, _read_rows
-from match_unpaired_vertices import match, scalar_array
-from xgb_data import JET_BRANCHES, PHYSICS_FEATURES, _numeric_vector, physical_invalid_mask, sanitize_values
+from analysis.data.cell_jet_data import CELL_BRANCHES, EVENTS_PER_CHUNK, _read_rows
+from analysis.data.match_unpaired_vertices import match, scalar_array
+from analysis.data.xgb_data import JET_BRANCHES, PHYSICS_FEATURES, apply_jet_cuts, read_jet_fields, selected_jet_frame
 
 
 CELL_KEYS = ("runNumber", "eventNumber", "lumiBlock")
@@ -43,40 +43,17 @@ def _jet_chunks(tree, selected, source, cutflow):
 
         jet_counts = ak.to_numpy(ak.num(arrays["jet_pt"], axis=1), allow_missing=False)
         n_jets = int(jet_counts.sum())
-        clean = {}
-        for field in JET_BRANCHES:
-            values = sanitize_values(_numeric_vector(arrays, field, jet_counts, ctx))
-            values[physical_invalid_mask(field, values)] = np.nan
-            clean[field] = values
-
-        pt = clean["jet_pt"] / 1000.0
-        eta = clean["jet_eta"]
-        abs_eta = np.abs(eta)
-        tile = clean["jet_TileEnergyFrac"]
+        clean = read_jet_fields(arrays, jet_counts, ctx)
         cutflow[CUT_STAGES[0]] += n_jets
         keep = np.ones(n_jets, dtype=bool)
-        for step, condition in zip(CUT_STAGES[1:], (
-            np.isfinite(pt) & np.isfinite(eta) & np.isfinite(clean["jet_time_ATLAS"]),
-            pt >= MIN_PT_GEV,
-            abs_eta < MAX_ABS_ETA,
-            (tile > 0.0) & (tile < 1.0),
-            np.logical_and.reduce([np.isfinite(clean[field]) for field in PHYSICS_FEATURES]),
-        ), strict=True):
-            keep &= condition
-            cutflow[step] += int(keep.sum())
+        pt = apply_jet_cuts(clean, keep, cutflow, min_pt_GeV=MIN_PT_GEV, max_abs_eta=MAX_ABS_ETA, require_mixed=True)
+        keep &= np.logical_and.reduce([np.isfinite(clean[field]) for field in PHYSICS_FEATURES])
+        cutflow["finite_standard_features"] += int(keep.sum())
 
         if keep.any():
             event_groups = [f"unpaired:{run}:{event}" for _, (run, event, _) in bucket]
-            offsets = np.repeat(np.cumsum(jet_counts) - jet_counts, jet_counts)
-            yield pd.DataFrame({
-                "label": 1, "sample": "unpaired", "split": "test",
-                "event_group": np.repeat(event_groups, jet_counts)[keep],
-                "source_file": source, "row_index": np.repeat(row_numbers, jet_counts)[keep],
-                "jet_index": (np.arange(n_jets) - offsets)[keep],
-                "jet_pt_GeV": pt[keep], "jet_eta": eta[keep], "jet_abs_eta": abs_eta[keep],
-                **{field: clean[field][keep] for field in PHYSICS_FEATURES},
-                "jet_BIB_score": clean["jet_BIB_score"][keep],
-            })
+            yield selected_jet_frame(clean, pt, keep, jet_counts, row_numbers, event_groups, source,
+                                     sample="unpaired", label=1, split="test")
 
 
 def _select_run(records, run):

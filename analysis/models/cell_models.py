@@ -97,23 +97,23 @@ def build_model(name, jet_dim, cell_dim, **options):
     if name == "transformer":
         return CellTransformer(jet_dim, cell_dim)
     if name == "pairwise_transformer":
-        from part_cell_model import PairwiseCellTransformer
+        from analysis.models.part_cell_model import PairwiseCellTransformer
 
         return PairwiseCellTransformer(jet_dim, cell_dim)
     if name == "particle_net_lite":
-        from particle_net_cell_model import ParticleNetLiteCells
+        from analysis.models.particle_net_cell_model import ParticleNetLiteCells
 
         return ParticleNetLiteCells(jet_dim, cell_dim, **options)
     if name in ("deep_cell_transformer", "bib_cell_transformer"):
-        from deep_cell_transformer import DeepCellTransformer
+        from analysis.models.deep_cell_transformer import DeepCellTransformer
 
         return DeepCellTransformer(jet_dim, cell_dim, physics=name == "bib_cell_transformer", **options)
     if name == "set_transformer":
-        from set_cell_transformer import SetCellTransformer
+        from analysis.models.set_cell_transformer import SetCellTransformer
 
         return SetCellTransformer(jet_dim, cell_dim)
     if name == "cluster_transformer":
-        from cluster_cell_transformer import ClusterCellTransformer
+        from analysis.models.cluster_cell_transformer import ClusterCellTransformer
 
         return ClusterCellTransformer(jet_dim, cell_dim)
     raise ValueError(f"Unknown model {name!r}")

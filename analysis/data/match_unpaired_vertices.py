@@ -130,6 +130,11 @@ def read_file(tree, path, relative_path, key_fields, vertex_field):
             yield Row(relative_path, offset + index, key, value)
 
 
+def _nonnegative(values):
+    data = np.ma.getdata(values)
+    return data, ~np.ma.getmaskarray(values) & (data >= 0)
+
+
 def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, target_keys, counts,
                           *, signed_event_column=None):
     """Count every raw row; materialize only rows that match a local cell key."""
@@ -143,18 +148,16 @@ def read_matched_vertices(tree, path, relative_path, key_fields, vertex_field, t
             ids[signed_event_column] = events.astype(np.uint32)
         size = len(values)
         counts["vertex_rows"] += size
-        data = np.ma.getdata(values)
-        valid_values = ~np.ma.getmaskarray(values) & (data >= 0)
+        data, valid_values = _nonnegative(values)
         if data.dtype.kind == "f":
             valid_values &= np.isfinite(data) & (data < 2**53) & (data == np.floor(data))
         counts["invalid_vertex_count_rows"] += size - int(np.count_nonzero(valid_values))
 
         keys = np.empty(size, dtype=target_keys.dtype)
         valid_ids = np.ones(size, dtype=bool)
-        for name, ids_column in zip(keys.dtype.names, ids):
-            data = np.ma.getdata(ids_column)
-            valid_ids &= ~np.ma.getmaskarray(ids_column) & (data >= 0)
-            keys[name] = data
+        for name, column in zip(keys.dtype.names, ids):
+            keys[name], valid = _nonnegative(column)
+            valid_ids &= valid
         valid_rows = np.flatnonzero(valid_ids)
         counts["invalid_vertex_key_rows"] += size - len(valid_rows)
         if len(target_keys):
@@ -275,7 +278,7 @@ def match(
     vertex_event_int32_bits=False,
 ):
     cell_dir, vertex_dir = Path(cell_dir).resolve(), Path(vertex_dir).resolve()
-    if cell_dir == vertex_dir or cell_dir in vertex_dir.parents or vertex_dir in cell_dir.parents:
+    if vertex_dir.is_relative_to(cell_dir) or cell_dir.is_relative_to(vertex_dir):
         raise ValueError("Use separate cell and vertex input directories")
     key_fields = tuple(key_fields)
     vertex_keys = tuple(vertex_keys) if vertex_keys is not None else key_fields
@@ -347,7 +350,7 @@ def write_outputs(output_dir, report, records):
     output_dir = Path(output_dir).resolve()
     for key in ("cell_dir", "vertex_dir"):
         source = Path(report[key])
-        if output_dir == source or source in output_dir.parents:
+        if output_dir.is_relative_to(source):
             raise ValueError("Keep the output directory separate from the ROOT inputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     with gzip.open(output_dir / "event_mapping.csv.gz", "wt", encoding="utf-8", newline="") as out:

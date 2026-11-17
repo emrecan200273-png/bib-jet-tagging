@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).parent / ".cache/matplotlib"))
+from analysis import PROJECT_ROOT
+
+os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / "analysis/.cache/matplotlib"))
 
 import awkward as ak
 import matplotlib
@@ -16,11 +18,11 @@ import numpy as np
 import pandas as pd
 import uproot
 
-from data_paths import resolve_data_paths
-from train_xgboost import balanced_weights, fit_booster, predict_model, write_json
-from xgb_data import assign_event_splits, preserve_splits, sanitize_values
-from xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores, jet_time_regions, rates, weighted_cut
-from xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
+from analysis.data.data_paths import resolve_data_paths
+from analysis.training.train_xgboost import balanced_weights, fit_booster, predict_model, write_json
+from analysis.data.xgb_data import assign_event_splits, preserve_splits, sanitize_values
+from analysis.evaluation.xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores, jet_time_regions, rates, weighted_cut
+from analysis.evaluation.xgb_matching import add_kinematic_bins, overlap_weights, supported_kinematic_bins
 
 
 TRAIN_RUN = 484258
@@ -142,24 +144,25 @@ def run_study(project_root):
     support = supported_kinematic_bins(add_kinematic_bins(train))
     delayed_val = validation["jet_time_ATLAS"].gt(DELAYED_TIME_NS).to_numpy()
     delayed_val_frame = add_kinematic_bins(validation.loc[delayed_val])
-    shared_val_w = overlap_weights(delayed_val_frame, support)
+    val_regions = {"all": (validation, slice(None), None),
+                   "delayed": (delayed_val_frame, delayed_val, None),
+                   "common_delayed": (delayed_val_frame, delayed_val, overlap_weights(delayed_val_frame, support))}
     models, summary = {}, {}
-    thresholds = {region: {} for region in ("all", "delayed", "common_delayed")}
+    thresholds = {region: {} for region in val_regions}
     for name, features in FEATURES.items():
         model = fit_booster(train, validation, features, settings["training_parameters"],
                             settings["early_stopping"]["rounds"], train_w, val_w)
         models[name] = model
         val_score = predict_model(model, validation, features)
-        thresholds["all"][name] = choose_threshold(validation["label"], val_score, target)
-        thresholds["delayed"][name] = choose_threshold(delayed_val_frame["label"], val_score[delayed_val], target)
-        thresholds["common_delayed"][name] = weighted_cut(delayed_val_frame, val_score[delayed_val], shared_val_w, target)
+        retention = {}
+        for region, (frame, mask, weights) in val_regions.items():
+            scores = val_score[mask]
+            cut = (choose_threshold(frame["label"], scores, target) if weights is None
+                   else weighted_cut(frame, scores, weights, target))
+            thresholds[region][name] = cut
+            retention[region] = rates(frame, scores, cut, weights)["llp_kept"]
         summary[name] = {"features": features, "trees": model.get_booster().num_boosted_rounds(),
-                         "validation_llp_keep": {region: rates(frame, scores, thresholds[region][name], weights)["llp_kept"]
-                                                 for region, frame, scores, weights in [
-                                                     ("all", validation, val_score, None),
-                                                     ("delayed", delayed_val_frame, val_score[delayed_val], None),
-                                                     ("common_delayed", delayed_val_frame, val_score[delayed_val], shared_val_w),
-                                                 ]}}
+                         "validation_llp_keep": retention}
 
     per_run = {TRAIN_RUN: test[columns]}
     for run, frame in unpaired.loc[unpaired["run"].ne(TRAIN_RUN)].groupby("run", sort=True):
@@ -225,5 +228,5 @@ def run_study(project_root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     run_study(parser.parse_args().project_root)

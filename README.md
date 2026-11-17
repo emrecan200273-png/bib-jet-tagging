@@ -1,39 +1,43 @@
 # BIB jet tagging
 
-This project tests whether machine learning can tag beam-induced background
-(BIB) in ATLAS jets while keeping jets from long-lived particles (LLPs).
+Can we tag beam-induced background (BIB) in ATLAS data while keeping jets
+from long-lived particles (LLPs)?
 
-## Where to start
+## Where to look
 
-| Step | Code | What it does |
-| --- | --- | --- |
-| Select the jets | [xgb_data.py](analysis/xgb_data.py) | Selects LLP and unpaired jets and splits whole events into train, validation and test. |
-| Match the vertex counts | [match_unpaired_vertices.py](analysis/match_unpaired_vertices.py) | Joins the separate vertex ntuple to the cell ntuple by run, event and luminosity block. |
-| Read the cells | [cell_jet_data.py](analysis/cell_jet_data.py) | Uses `jet_n_clusters` and `cluster_n_cells` to find the cells for each saved jet. |
-| Train the models | [train_cell_models.py](analysis/train_cell_models.py), [train_pairwise_cells.py](analysis/train_pairwise_cells.py) | Trains the cell models using the same event splits. |
-| Compare scores | [compare_part_emil.py](analysis/compare_part_emil.py) | Applies ParT and the stored `jet_BIB_score` to the same test jets. |
+| Folder | What's inside |
+| --- | --- |
+| [notebooks](notebooks/) | File checks, first plots and the XGBoost baseline |
+| [analysis/data](analysis/data/) | ROOT reading, jet selection and vertex matching |
+| [analysis/models](analysis/models/) | Cell models and [notes on the papers](analysis/models/README.md) |
+| [analysis/training](analysis/training/) | XGBoost and cell-model training |
+| [analysis/evaluation](analysis/evaluation/) | Metrics, kinematic bins and plots |
+| [analysis/studies](analysis/studies/) | Comparisons and checks on the trained models |
 
-The [analysis guide](analysis/README.md) lists the input samples and commands.
-It also shows how [Set Transformer and Cluster Transformer compare with ParT](analysis/README.md#set-transformer-and-cluster-transformer).
+The [analysis guide](analysis/README.md) lists the inputs and the order to run
+the code. Start with [cell_jet_data.py](analysis/data/cell_jet_data.py) to see
+how the cluster counts link cells to each jet.
 
-## First comparison
+## Latest test on run 484258
 
-For unpaired run `484258` and the held-out LLP simulation, we compared jets
-with ATLAS time above 3 ns and valid scores from both methods. Each score cut
-was chosen to keep at least 95% of delayed LLP jets on validation.
+We matched scores by jet ID and used ATLAS jet time above 3 ns. Of the 42
+delayed unpaired jets, 40 had valid scores from all three methods. The cuts
+were chosen on delayed LLP validation jets to keep at least 95%.
 
-| Score | Unpaired jets tagged as BIB | Simulated LLP jets kept |
+| Method | Unpaired jets tagged as BIB | Simulated LLP jets kept |
 | --- | ---: | ---: |
-| Stored `jet_BIB_score` | 9 / 40 | 782 / 816 |
+| Set Transformer | 40 / 40 | 779 / 816 |
 | ParT | 40 / 40 | 782 / 816 |
+| Stored `jet_BIB_score` | 9 / 40 | 782 / 816 |
 
 In the smaller 3–10 ns subset with similar $p_T$ and $|\eta|$, ParT kept 11 of
-16 LLP jets and the stored score kept 13. Run `486706` is the next independent
-check and still needs a cell export.
+16 LLP jets and the stored score kept 13. The next check is a new unpaired
+run. Run `486706` still needs a cell export. See the [cell-model comparison](analysis/README.md#set-transformer-and-cluster-transformer)
+for timing, loss gaps and Cluster Transformer.
 
-## Setup
+## Set up
 
-Use Python 3.12. From the project folder, run:
+Use Python 3.12 and run from the project root.
 
 ```bash
 python3.12 -m venv analysis/.venv
@@ -43,58 +47,33 @@ python -m ipykernel install --user --name ppp-first-look --display-name "PPP fir
 python tools/notebook_git.py --install
 ```
 
-Choose **PPP first look** as the notebook kernel in VS Code. The Git filter
-keeps notebook outputs on your computer and stores notebook source in Git.
+Choose **PPP first look** as the notebook kernel. The last command keeps
+notebook execution outputs on your computer when you commit.
 
-## Data
-
-The ROOT files and verified file list come from CERNBox/EOS. The default layout
-uses `DataForEmre/` and
-`analysis/provenance/DataForEmre_verified_manifest_20261029.json`. To use a local
-copy or mounted EOS paths elsewhere, set both paths before running the analysis:
+The ROOT files and the verified manifest come from CERNBox/EOS. The default
+paths are `DataForEmre/` and
+`analysis/provenance/DataForEmre_verified_manifest_20261029.json`.
+To point to a separate copy of the same data and manifest, set the paths below.
 
 ```bash
 export PPP_DATA_ROOT=/path/to/DataForEmre
 export PPP_DATA_MANIFEST=/path/to/verified_manifest.json
 ```
 
-Use a manifest for the same version of the data. Raw data, private manifests,
-plots and model outputs stay local.
-
-[Emil's GitLab](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public)
-contains the code that writes the jet, cluster and cell variables, including
-the BIB score, and small test files. We inspected
-[commit a7c625c](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public/-/commit/a7c625c364893bbc90248fbb98a5251c1a54fdeb).
-The exact version used to produce the shared ROOT files still needs confirmation.
+[Emil's GitLab](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public) contains
+the ntuple producer. We inspected [commit a7c625c](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public/-/commit/a7c625c364893bbc90248fbb98a5251c1a54fdeb).
+The production version of our ROOT files still needs confirmation.
 
 ## Run the notebooks and baseline
 
-- [Notebook 1](analysis/01_remote_data_inventory.ipynb) checks the input files.
-- [Notebook 2](analysis/02_first_data_look.ipynb) plots a small sample.
-- [Notebook 3](analysis/03_xgboost_baseline.ipynb) shows the XGBoost baseline.
-
 ```bash
-python analysis/run_first_look.py 01_remote_data_inventory.ipynb
-python analysis/run_first_look.py 02_first_data_look.ipynb
-python analysis/train_xgboost.py
-python analysis/run_first_look.py 03_xgboost_baseline.ipynb
-```
-
-The first look reads up to 1,000 rows per LLP file and 6 per unpaired file.
-XGBoost verifies the source hashes and reads the selected datasets in full.
-Results go in `analysis/outputs/`. Notebook 3 uses the saved results when
-available. Set `RETRAIN = True` in the notebook to run the training again.
-
-The baseline uses $p_T$ ≥ 30 GeV, |η| < 1.7 and a Tile energy fraction between
-0 and 1, excluding the endpoints. It takes truth-matched jets from the LLP
-simulation and uses unpaired data as a BIB-enriched sample. All jets from an
-event stay together in the 60/20/20 train/validation/test split. The score cut
-targets 95% LLP retention on validation.
-
-ROOT stores momenta in MeV, positions in mm and times in ns. The analysis uses
-`jet_time_ATLAS` and the original stored cell times. See the output
-`feature_schema.json` for the baseline inputs and cut.
-
-```bash
+python tools/run_first_look.py 01_remote_data_inventory.ipynb
+python tools/run_first_look.py 02_first_data_look.ipynb
+python -m analysis.training.train_xgboost
+python tools/run_first_look.py 03_xgboost_baseline.ipynb
 python -m unittest discover -s tests
 ```
+
+Results go in `analysis/outputs/`. The first look uses up to 1,000 rows per LLP
+file and 6 per unpaired file. The baseline verifies the file hashes and reads
+the selected datasets in full. Set `RETRAIN = True` in notebook 3 to rebuild it.

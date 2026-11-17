@@ -11,9 +11,10 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "analysis"))
-from train_xgboost import balanced_weights, predict_model, score_saved_model
-from xgb_data import PHYSICS_FEATURES
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from analysis.training.train_xgboost import balanced_weights, predict_model, score_saved_model
+from analysis.training import train_xgboost
+from analysis.data.xgb_data import PHYSICS_FEATURES
 
 
 def _jets(labels):
@@ -88,7 +89,7 @@ class SavedInferenceTests(unittest.TestCase):
         frame.loc[1, "jet_time_spread"] = -1.
         frame.loc[2, "jet_n_clusters"] = 0.
         frame.loc[3, "jet_n_clusters"] = 1.5
-        with patch("train_xgboost.predict_model", return_value=np.array([.2] * 4)) as predict:
+        with patch.object(train_xgboost, "predict_model", return_value=np.array([.2] * 4)) as predict:
             result = score_saved_model(frame, self.output)
             seen = predict.call_args.args[1]
         self.assertTrue(result.in_selection.all())
@@ -128,7 +129,7 @@ class SavedInferenceTests(unittest.TestCase):
     def test_matched_scope_accepts_empty_input_without_scoring(self):
         frame = _jets([])
         with TemporaryDirectory(prefix="ppp-xgb-empty-scope-") as directory:
-            with patch("train_xgboost.predict_model") as predict:
+            with patch.object(train_xgboost, "predict_model") as predict:
                 result = score_saved_model(frame, self._matched_schema(directory))
         self.assertTrue(result.empty)
         self.assertEqual(result.columns.tolist(), ["in_selection", "bib_score", "tagged_as_bib"])

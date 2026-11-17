@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 import uproot
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "analysis"))
-from xgb_data import DATA_GROUPS, assign_event_splits, prepare_training_data, sanitize_values
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from analysis.data.xgb_data import DATA_GROUPS, assign_event_splits, prepare_training_data, sanitize_values
 
 
 class EventSplitTests(unittest.TestCase):

@@ -10,8 +10,8 @@ import unittest
 def check_neighbor_ties():
     import torch
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "analysis"))
-    from particle_net_cell_model import ParticleNetLiteCells
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from analysis.models.particle_net_cell_model import ParticleNetLiteCells
 
     torch.set_num_threads(1)
     torch.manual_seed(42)

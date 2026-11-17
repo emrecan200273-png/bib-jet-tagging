@@ -14,7 +14,9 @@ import os
 from pathlib import Path
 import time
 
-os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).parent / ".cache/matplotlib"))
+from analysis import PROJECT_ROOT
+
+os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / "analysis/.cache/matplotlib"))
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,10 +26,11 @@ from sklearn.inspection import permutation_importance
 from xgboost import XGBClassifier
 from xgboost.callback import EarlyStopping
 
-from xgb_data import (PHYSICS_FEATURES, KINEMATIC_FEATURES, prepare_training_data,
-                      physical_invalid_mask, sanitize_values, tile_fraction_mask)
-from xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores, make_plots
-from xgb_matching import _bin_indices, match_kinematics
+from analysis.data.xgb_data import (
+    KINEMATIC_FEATURES, PHYSICS_FEATURES, physical_invalid_mask, prepare_training_data, sanitize_values, tile_fraction_mask,
+)
+from analysis.evaluation.xgb_evaluation import DELAYED_TIME_NS, choose_threshold, evaluate_scores, make_plots
+from analysis.evaluation.xgb_matching import _bin_indices, match_kinematics
 
 
 MODEL_FEATURES = {
@@ -36,6 +39,10 @@ MODEL_FEATURES = {
     "Kinematics only": list(KINEMATIC_FEATURES),
     "Without time uncertainty": [f for f in PHYSICS_FEATURES if f != "jet_time_sigma"],
 }
+MODEL_SLUGS = {name: name.lower().replace(" ", "_") for name in MODEL_FEATURES}
+PREDICTION_COLUMNS = ["label", "sample", "event_group", "source_file", "row_index", "jet_index",
+                      "jet_pt_GeV", "jet_eta", "jet_time_ATLAS"]
+EARLY_STOP_ROUNDS = 40
 UPSTREAM = {
     "url": "https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public",
     "inspected_commit": "a7c625c364893bbc90248fbb98a5251c1a54fdeb",
@@ -152,6 +159,55 @@ def _subset_report(frame, scores, threshold, seed):
                                        bootstrap_repeats=200, seed=seed)
                         if mask.any() else None)
     return result
+
+
+def _fit_models(train, validation, params, target, output_dir, *, matched=False):
+    """Fit each feature set, lock its validation cut, and verify the saved model."""
+    train_w, val_w = (balanced_weights(frame.label, train.label) for frame in (train, validation))
+    models, thresholds, histories, metrics, importance = {}, {}, {}, {}, []
+    for name, features in MODEL_FEATURES.items():
+        if not matched:
+            print(f"Training {name}: {', '.join(features)}", flush=True)
+        model = fit_booster(train, validation, features, params, EARLY_STOP_ROUNDS, train_w, val_w,
+                            include_train_eval=True)
+        val_scores = predict_model(model, validation, features)
+        cut = choose_threshold(validation.label, val_scores, target)
+        _save_and_verify_model(model, output_dir / f"{MODEL_SLUGS[name]}.ubj", validation, features, val_scores,
+                               "Saved model predictions differ after loading.")
+        models[name], thresholds[name], histories[name] = model, cut, model.evals_result()
+        details = {"features": features}
+        if not matched:
+            details["best_iteration_zero_based"] = int(model.best_iteration)
+        metrics[name] = dict(details, saved_trees=int(model.get_booster().num_boosted_rounds()),
+                             validation=evaluate_scores(validation, val_scores, cut, bootstrap_repeats=0))
+        importance.extend({"model": name, "feature": field, "importance": float(gain)}
+                          for field, gain in zip(features, model.feature_importances_))
+    return models, thresholds, histories, metrics, pd.DataFrame(importance)
+
+
+def _test_models(test, models, thresholds, metrics, seed, *, matched=False):
+    """Evaluate already fitted models with their frozen validation cuts."""
+    scores = {}
+    for name, model in models.items():
+        score = scores[name] = predict_model(model, test, MODEL_FEATURES[name])
+        cut = thresholds[name]
+        stats = metrics[name]["test"] = evaluate_scores(test, score, cut, seed=seed)
+        metrics[name]["test_regions"] = _subset_report(test, score, cut, seed)
+        heading = f"Matched {name}: AUC" if matched else f"{name}: test AUC"
+        print(f"{heading}={stats['roc_auc']:.4f}; BIB tag={stats['bib_tag_fraction']:.1%}, "
+              f"LLP keep={stats['llp_keep_fraction']:.1%}", flush=True)
+    return scores
+
+
+def _write_predictions(test, scores, output_dir, *, thresholds=None):
+    columns = PREDICTION_COLUMNS if thresholds is None else [*PREDICTION_COLUMNS, "jet_BIB_score"]
+    predictions = test[columns].copy()
+    for name, score in scores.items():
+        slug = MODEL_SLUGS[name]
+        predictions[f"{slug}_score"] = score
+        if thresholds is not None:
+            predictions[f"{slug}_tagged_as_bib"] = score >= thresholds[name]
+    predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)
 
 
 def _plot_inputs(frame, features, output_dir):
@@ -275,36 +331,11 @@ def _matched_check(frame, params, output_dir, *, seed, target, selection):
     fig.savefig(matching_plot, dpi=170, bbox_inches="tight")
     plt.close(fig)
     print(f"Kinematic check: {len(train):,} train, {len(validation):,} validation, {len(test):,} test jets.", flush=True)
-    metrics, scores, thresholds, histories, gain_rows = {}, {}, {}, {}, []
-    train_w = balanced_weights(train.label, train.label)
-    validation_w = balanced_weights(validation.label, train.label)
-    for name, features in MODEL_FEATURES.items():
-        model = fit_booster(train, validation, features, params, 40, train_w, validation_w,
-                            include_train_eval=True)
-        val_scores = predict_model(model, validation, features)
-        threshold = choose_threshold(validation.label, val_scores, target)
-        slug = name.lower().replace(" ", "_")
-        _save_and_verify_model(model, output_dir / f"{slug}.ubj", validation, features, val_scores,
-                               "Matched-check model changed on save/reload.")
-        # Cut and tree count are frozen before scoring this check's test subset.
-        score = predict_model(model, test, features)
-        scores[name], thresholds[name], histories[name] = score, threshold, model.evals_result()
-        metrics[name] = {"features": features, "saved_trees": int(model.get_booster().num_boosted_rounds()),
-                         "validation": evaluate_scores(validation, val_scores, threshold, bootstrap_repeats=0),
-                         "test": evaluate_scores(test, score, threshold, seed=seed),
-                         "test_regions": _subset_report(test, score, threshold, seed)}
-        gain_rows.extend({"model": name, "feature": f, "importance": float(v)}
-                         for f, v in zip(features, model.feature_importances_))
-        print(f"Matched {name}: AUC={metrics[name]['test']['roc_auc']:.4f}; "
-              f"BIB tag={metrics[name]['test']['bib_tag_fraction']:.1%}, "
-              f"LLP keep={metrics[name]['test']['llp_keep_fraction']:.1%}", flush=True)
-    plots = make_plots(test, scores, thresholds, histories, pd.DataFrame(gain_rows), output_dir)
+    models, thresholds, histories, metrics, gain = _fit_models(train, validation, params, target, output_dir, matched=True)
+    scores = _test_models(test, models, thresholds, metrics, seed, matched=True)
+    plots = make_plots(test, scores, thresholds, histories, gain, output_dir)
     plots.append(matching_plot)
-    predictions = test[["label", "sample", "event_group", "source_file", "row_index", "jet_index",
-                        "jet_pt_GeV", "jet_eta", "jet_time_ATLAS"]].copy()
-    for name, score in scores.items():
-        predictions[name.lower().replace(" ", "_") + "_score"] = score
-    predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)
+    _write_predictions(test, scores, output_dir)
     write_json(output_dir / "training_history.json", histories)
     write_json(output_dir / "feature_schema.json", {
         "features": MODEL_FEATURES["XGBoost"], "threshold": thresholds["XGBoost"],
@@ -343,45 +374,14 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
     validation = frame.loc[frame.split == "validation"].copy()
     test = frame.loc[frame.split == "test"].copy()
     print(f"Selected {len(frame):,} jets: {len(train):,} train, {len(validation):,} validation, {len(test):,} test.", flush=True)
-    train_w = balanced_weights(train.label, train.label)
-    validation_w = balanced_weights(validation.label, train.label)
     params = dict(n_estimators=600, learning_rate=.05, max_depth=3, min_child_weight=10,
                   subsample=.8, colsample_bytree=1., reg_lambda=5., reg_alpha=0.,
                   objective="binary:logistic", eval_metric="logloss", tree_method="hist",
                   n_jobs=4, random_state=seed, base_score=.5)
-    models, histories, thresholds, scores, metrics, importance = {}, {}, {}, {}, {}, []
-    slugs = {"XGBoost": "xgboost", "Timing only": "timing_only", "Kinematics only": "kinematics_only",
-             "Without time uncertainty": "without_time_uncertainty"}
     # Fixed settings for this reproducible run. The no-sigma ablation and
     # matching study are exploratory follow-ups to the initial three models.
-    for name, features in MODEL_FEATURES.items():
-        print(f"Training {name}: {', '.join(features)}", flush=True)
-        model = fit_booster(train, validation, features, params, 40, train_w, validation_w,
-                            include_train_eval=True)
-        val_scores = predict_model(model, validation, features)
-        threshold = choose_threshold(validation.label, val_scores, target_llp_keep)
-        models[name] = model
-        histories[name] = model.evals_result()
-        thresholds[name] = threshold
-        slug = slugs[name]
-        _save_and_verify_model(model, output_dir / f"{slug}.ubj", validation, features, val_scores,
-                               "Saved model predictions differ after loading.")
-        metrics[name] = {
-            "features": features, "best_iteration_zero_based": int(model.best_iteration),
-            "saved_trees": int(model.get_booster().num_boosted_rounds()),
-            "validation": evaluate_scores(validation, val_scores, threshold, bootstrap_repeats=0),
-        }
-        importance.extend({"model": name, "feature": feature, "importance": float(gain)}
-                          for feature, gain in zip(features, model.feature_importances_))
-    # No fitting, hyperparameter search, threshold selection or model selection below.
-    for name, features in MODEL_FEATURES.items():
-        score = predict_model(models[name], test, features)
-        scores[name] = score
-        metrics[name]["test"] = evaluate_scores(test, score, thresholds[name], seed=seed)
-        metrics[name]["test_regions"] = _subset_report(test, score, thresholds[name], seed)
-        print(f"{name}: test AUC={metrics[name]['test']['roc_auc']:.4f}; "
-              f"BIB tag={metrics[name]['test']['bib_tag_fraction']:.1%}, "
-              f"LLP keep={metrics[name]['test']['llp_keep_fraction']:.1%}", flush=True)
+    models, thresholds, histories, metrics, gain = _fit_models(train, validation, params, target_llp_keep, output_dir)
+    scores = _test_models(test, models, thresholds, metrics, seed)
     # Validation-only permutation checks avoid using test importance to tune the model.
     perm = permutation_importance(models["XGBoost"], validation[MODEL_FEATURES["XGBoost"]],
                                   validation.label, scoring="roc_auc", n_repeats=8,
@@ -390,7 +390,6 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
                                 "auc_drop_mean": perm.importances_mean,
                                 "auc_drop_std": perm.importances_std})
     permutation.to_csv(output_dir / "validation_permutation_importance.csv", index=False)
-    gain = pd.DataFrame(importance)
     gain.to_csv(output_dir / "feature_importance.csv", index=False)
     plots = make_plots(test, scores, thresholds, histories, gain, output_dir)
     plots.append(_plot_inputs(train, MODEL_FEATURES["XGBoost"], output_dir))
@@ -402,12 +401,7 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
                                      seed=seed, target=target_llp_keep,
                                      selection={"min_pt_GeV": min_pt_GeV, "max_abs_eta": max_abs_eta,
                                                 "tile_fraction": "strictly between 0 and 1"})
-    predictions = test[["label", "sample", "event_group", "source_file", "row_index", "jet_index",
-                        "jet_pt_GeV", "jet_eta", "jet_time_ATLAS", "jet_BIB_score"]].copy()
-    for name, score in scores.items():
-        predictions[f"{slugs[name]}_score"] = score
-        predictions[f"{slugs[name]}_tagged_as_bib"] = score >= thresholds[name]
-    predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)
+    _write_predictions(test, scores, output_dir, thresholds=thresholds)
     schema = {
         "features": MODEL_FEATURES["XGBoost"], "units": {"energy_momentum": "GeV after MeV/1000 conversion", "time": "ns", "eta": "dimensionless"},
         "label_definition": {"0": "truth-matched LLP jet in selected simulation", "1": "unpaired jet, working BIB label"},
@@ -426,7 +420,7 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
         "data_audit_file": "data_audit.json", "upstream": UPSTREAM,
         "models": metrics, "stored_tagger_comparison": comparison,
         "matched_kinematics": matched_report,
-        "training_parameters": params, "early_stopping": {"rounds": 40, "metric": "class-balanced validation logloss", "test_used": False},
+        "training_parameters": params, "early_stopping": {"rounds": EARLY_STOP_ROUNDS, "metric": "class-balanced validation logloss", "test_used": False},
         "study_sequence": "Initial five-input, timing-only and kinematics-only models used fixed settings. After inspecting that comparison, bin balancing and the no-time-uncertainty ablation were added as exploratory diagnostics. No hyperparameter tuning or final model selection on the test was performed; further improvements need a fresh independent test.",
         "weighting": "Training and early stopping use inverse training-class-frequency weights. Reported test jet fractions are unweighted and are not event rates.",
         "uncertainty": "Event-bootstrap test-rate intervals hold fitted model and validation threshold fixed. They exclude training/threshold/purity and data-MC uncertainty.",
@@ -441,7 +435,7 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
         ],
         "plots": [str(Path(p).relative_to(output_dir)) for p in plots],
         "versions": {pkg: version(pkg) for pkg in ["xgboost", "scikit-learn", "numpy", "pandas", "uproot", "awkward", "matplotlib", "scipy"]},
-        "code_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path(__file__), Path(__file__).with_name("xgb_data.py"), Path(__file__).with_name("xgb_evaluation.py"), Path(__file__).with_name("xgb_matching.py")]},
+        "code_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path(__file__), PROJECT_ROOT / "analysis/data/xgb_data.py", PROJECT_ROOT / "analysis/evaluation/xgb_evaluation.py", PROJECT_ROOT / "analysis/evaluation/xgb_matching.py"]},
         "elapsed_seconds": round(time.monotonic() - started, 2),
     }
     write_json(output_dir / "training_history.json", histories)
@@ -452,64 +446,35 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
                      "threshold_from_validation": thresholds[name], "trees": m["saved_trees"]}
                     for name, m in metrics.items()]
     pd.DataFrame(summary_rows).to_csv(output_dir / "results.csv", index=False)
-    _write_report(report, audit, output_dir)
+    _write_report(report, output_dir)
     print(f"Saved models, metrics, report and plots to {output_dir}", flush=True)
     return report
 
 
-def _write_report(report, audit, output_dir):
-    lines = ["# First XGBoost run", "", "This is a first check on selected jets from our local files.",
-             "It compares unpaired data with truth-matched LLP simulation. It is not a final BIB tagger.", "",
-             "## What I used", "", "- Label 1: unpaired jets, using the meeting's working BIB label.",
-             "- Label 0: jets with `jet_is_llp_matched == 1`. Other jets in LLP events are left out.",
-             f"- Both samples: pT >= {report['selection']['min_pt_GeV']:g} GeV, |eta| < {report['selection']['max_abs_eta']:g}, and 0 < Tile energy fraction < 1.",
-             "- The last cut selects common mixed-energy support, motivated by the LAr/Tile cell requirement in LLP matching. It does not reproduce every truth-matching criterion.",
-             "- All jets from one event stay in one split: about 60% training, 20% validation and 20% test.",
-             f"- The score cut is chosen on validation to keep at least {report['target_llp_keep_on_validation']:.0%} of those LLP jets. Test data are kept separate.", "",
-             "## Test results", "", "| Model | ROC AUC | Unpaired jets tagged | LLP jets kept |", "|---|---:|---:|---:|"]
-    for name, model in report["models"].items():
-        metric = model["test"]
-        lines.append(f"| {name} | {metric['roc_auc']:.4f} | {metric['bib_tag_fraction']:.1%} | {metric['llp_keep_fraction']:.1%} |")
-    main = report["models"]["XGBoost"]
-    lines += ["", "The main model gets ATLAS jet time, time spread, timing uncertainty, cluster count and Tile energy fraction.",
-              "The control models check timing alone, momentum/direction alone, and removing timing uncertainty.",
-              "Each has its own validation-chosen cut. The reported jet fractions are unweighted sample fractions.", ""]
-    for key, name in [("bib_tag_fraction", "Unpaired tag fraction"), ("llp_keep_fraction", "LLP keep fraction")]:
-        ci = main["test"][key + "_ci95"]
-        if ci:
-            lines.append(f"- {name}: {main['test'][key]:.1%}; fixed-cut event-bootstrap 95% interval {ci[0]:.1%} to {ci[1]:.1%}.")
-    delayed = main["test_regions"]["delayed_time_gt_3ns"]
-    if delayed and delayed["llp_keep_fraction"] is not None:
-        lines.append(f"- LLP jets with ATLAS time > 3 ns: {delayed['class_counts']['LLP']:,} test jets; {delayed['llp_keep_fraction']:.1%} kept at the same cut.")
-    lines += ["", "## Extra check: more similar momentum and direction", "",
-              "The kinematics-only control also separates the original samples well. That makes the first result hard to interpret as BIB recognition.",
-              "I therefore added an exploratory check with equal class counts in narrow pT/|eta| bins, separately inside the existing train/validation/test splits.",
-              "This check uses fewer jets and describes a different population. It still does not remove MC/data or production differences.", "",
-              "| Model | Matched-check AUC | Unpaired jets tagged | LLP jets kept |", "|---|---:|---:|---:|"]
-    for name, model in report["matched_kinematics"]["models"].items():
-        metric = model["test"]
-        lines.append(f"| {name} | {metric['roc_auc']:.4f} | {metric['bib_tag_fraction']:.1%} | {metric['llp_keep_fraction']:.1%} |")
-    controlled = report["matched_kinematics"]["models"]["XGBoost"]["test"]
-    lines += ["", f"This check has {controlled['class_counts']['LLP']:,} LLP jets and {controlled['class_counts']['BIB']:,} unpaired jets in the test split."]
-    for key, name in [("bib_tag_fraction", "Unpaired tag fraction"), ("llp_keep_fraction", "LLP keep fraction")]:
-        ci = controlled[key + "_ci95"]
-        if ci:
-            lines.append(f"- {name}: {controlled[key]:.1%}; fixed-cut event-bootstrap 95% interval {ci[0]:.1%} to {ci[1]:.1%}.")
-    delayed_matched = report["matched_kinematics"]["models"]["XGBoost"]["test_regions"]["delayed_time_gt_3ns"]
-    if delayed_matched:
-        c = delayed_matched["confusion"]
-        lines += ["", "### The delayed region still needs work", "",
-                  f"For ATLAS jet time > 3 ns, the matched check tags {c['BIB_tagged_BIB']} of {delayed_matched['class_counts']['BIB']} unpaired jets as BIB, and keeps {c['LLP_kept_as_LLP']} of {delayed_matched['class_counts']['LLP']} LLP jets.",
-                  "The unpaired count is small. The overall result does not establish useful rejection for the delayed-jet search region.",
-                  "A next study should add validated constituent timing-position structure, use more delayed BIB examples, and reserve a new independent test sample."]
-    lines += ["", "## What the result does not settle", ""]
-    lines += [f"- {item}" for item in report["limitations"]]
-    lines += ["", "## Next meeting", "", "- Confirm the production version and LLP matching definition with Emil.",
-              "- Agree on the analysis region and how to handle jets outside the shared LAr/Tile selection.",
-              "- Ask for n_vrtx and a collision JetContent sample for cleaning and collision-efficiency checks.",
-              "- Test another run and LLP mass/lifetime, and control the pT/eta differences before making physics claims.", "",
-              "See metrics.json for counts, intervals, versions and all fixed diagnostic regions; data_audit.json for provenance and split checks.",
-              "The original-population model is xgboost.ubj. The balanced-check model is matched_kinematics/xgboost.ubj; each has its own feature_schema.json and validation cut.", ""]
+def _write_report(report, output_dir):
+    selection = report["selection"]
+    target = report["target_llp_keep_on_validation"]
+    lines = [
+        "# XGBoost baseline", "",
+        f"Unpaired and truth-matched LLP jets with pT >= {selection['min_pt_GeV']:g} GeV, "
+        f"|eta| < {selection['max_abs_eta']:g} and 0 < Tile energy fraction < 1.",
+        f"Cuts target {target:.0%} LLP retention on validation. All jets in an event share one split.", "",
+    ]
+    samples = {"Original sample": report["models"], "Shared pT and |eta|": report["matched_kinematics"]["models"]}
+    for title, models in samples.items():
+        lines += [f"## {title}", "", "| Model | AUC | Unpaired tagged | LLP kept |", "| --- | ---: | ---: | ---: |"]
+        for name, model in models.items():
+            m = model["test"]
+            lines.append(f"| {name} | {m['roc_auc']:.4f} | {m['bib_tag_fraction']:.1%} | {m['llp_keep_fraction']:.1%} |")
+        delayed = models["XGBoost"]["test_regions"]["delayed_time_gt_3ns"]
+        if delayed:
+            counts, decisions = delayed["class_counts"], delayed["confusion"]
+            lines += ["", f"Above 3 ns, XGBoost tagged {decisions['BIB_tagged_BIB']}/{counts['BIB']} unpaired jets "
+                      f"and kept {decisions['LLP_kept_as_LLP']}/{counts['LLP']} LLP jets."]
+        lines.append("")
+    lines += ["## Limits", "", *[f"- {item}" for item in report["limitations"]], "",
+              "See metrics.json for counts and event-bootstrap intervals, data_audit.json for input checks, "
+              "and feature_schema.json beside each saved model for its inputs and cut.", ""]
     (output_dir / "run_notes.md").write_text("\n".join(lines))
 
 
@@ -522,7 +487,7 @@ def main():
     parser.add_argument("--max-abs-eta", type=float, default=1.7)
     parser.add_argument("--skip-hashes", action="store_true", help="Check file sizes only; hashes are verified by default.")
     args = parser.parse_args()
-    run_experiment(Path(__file__).resolve().parents[1], args.output_dir, seed=args.seed,
+    run_experiment(PROJECT_ROOT, args.output_dir, seed=args.seed,
                    target_llp_keep=args.target_llp_keep, min_pt_GeV=args.min_pt_gev,
                    max_abs_eta=args.max_abs_eta, verify_hashes=not args.skip_hashes)
 

@@ -4,13 +4,15 @@ import argparse
 import json
 from pathlib import Path
 
-from train_cell_models import predict_logits, torch
-from cell_jet_data import CELL_FEATURES
-from compare_part_emil import check_part_replay, prepare_part
-from data_paths import resolve_data_paths
-from train_xgboost import write_json
-from train_xgboost_vertex import load_jets, paired_interval
-from xgb_evaluation import choose_threshold, evaluate_scores, jet_time_regions
+from analysis import PROJECT_ROOT
+
+from analysis.training.train_cell_models import predict_logits, torch
+from analysis.data.cell_jet_data import CELL_FEATURES
+from analysis.studies.compare_part_emil import check_part_replay, prepare_part
+from analysis.data.data_paths import resolve_data_paths
+from analysis.training.train_xgboost import write_json
+from analysis.training.train_xgboost_vertex import load_jets, paired_interval
+from analysis.evaluation.xgb_evaluation import choose_threshold, evaluate_scores, jet_time_regions
 import numpy as np
 import pandas as pd
 
@@ -79,5 +81,5 @@ def run_diagnostics(root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     run_diagnostics(parser.parse_args().project_root)

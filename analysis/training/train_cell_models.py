@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 
+from analysis import PROJECT_ROOT
+
 # Use a single OpenMP thread by default in the mixed PyTorch/XGBoost process.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -18,18 +20,18 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import torch
 from torch.nn import functional as F
 
-from train_xgboost import balanced_weights, score_saved_model, write_json
-from train_xgboost_vertex import (
+from analysis.training.train_xgboost import balanced_weights, score_saved_model, write_json
+from analysis.training.train_xgboost_vertex import (
     DELAYED_TIME_NS, SPLITS, kinematic_comparison, load_jets, make_comparison_plot, population,
 )
 import numpy as np
 import pandas as pd
 
-from cell_jet_data import CELL_FEATURES, extract_cells
-from cell_generalization import plot_learning_curves, summarize_generalization
-from cell_models import build_model, restore_model
-from data_paths import resolve_data_paths
-from xgb_evaluation import choose_threshold, evaluate_scores
+from analysis.data.cell_jet_data import CELL_FEATURES, extract_cells
+from analysis.evaluation.cell_generalization import plot_learning_curves, summarize_generalization
+from analysis.models.cell_models import build_model, restore_model
+from analysis.data.data_paths import resolve_data_paths
+from analysis.evaluation.xgb_evaluation import choose_threshold, comparison_rows, evaluate_scores
 
 
 DISPLAY_NAMES = {"xgboost": "XGBoost", "jet_mlp": "Jet MLP", "deep_sets": "Deep Sets", "transformer": "Transformer"}
@@ -219,19 +221,13 @@ def evaluation_regions(test_frame, thresholds, delayed_thresholds):
 def compare_test_scores(test_frame, test_scores, thresholds, delayed_thresholds, seed):
     comparisons, rows = {}, []
     for region, subset, cuts in evaluation_regions(test_frame, thresholds, delayed_thresholds):
+        frame = test_frame.loc[subset]
         comparisons[region] = {}
         for name in thresholds:
-            metrics = evaluate_scores(test_frame.loc[subset], test_scores[name][subset], cuts[name],
+            metrics = evaluate_scores(frame, test_scores[name][subset], cuts[name],
                                       seed=seed, bootstrap_repeats=2000)
             comparisons[region][name] = metrics
-            for key, count, denominator, rate in [
-                ("unpaired_tagged", "BIB_tagged_BIB", "BIB", "bib_tag_fraction"),
-                ("llp_kept", "LLP_kept_as_LLP", "LLP", "llp_keep_fraction"),
-            ]:
-                low, high = metrics[f"{rate}_ci95"] or (None, None)
-                rows.append({"region": region, "model": name, "metric": key, "successes": metrics["confusion"][count],
-                             "total": metrics["class_counts"][denominator], "fraction": metrics[rate],
-                             "ci95_low": low, "ci95_high": high})
+            rows.extend(comparison_rows(region, name, metrics))
     return comparisons, pd.DataFrame(rows)
 
 
@@ -367,7 +363,7 @@ def run_pilot(project_root, max_cells, max_epochs, batch_size, threads):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     cell_count = parser.add_mutually_exclusive_group()
     cell_count.add_argument("--max-cells", type=int, default=64)
     cell_count.add_argument("--all-cells", action="store_true", help="Compare an uncapped run to the saved 64-cell pilot")

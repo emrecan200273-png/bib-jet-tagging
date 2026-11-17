@@ -12,8 +12,8 @@ import numpy as np
 import pandas as pd
 import uproot
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "analysis"))
-from cell_jet_data import extract_cells
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from analysis.data.cell_jet_data import extract_cells
 
 
 class CellTransformerTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class CellTransformerTests(unittest.TestCase):
 def check_torch_models():
     import torch
 
-    from cell_models import build_model
+    from analysis.models.cell_models import build_model
 
     torch.set_num_threads(1)
     with torch.inference_mode():

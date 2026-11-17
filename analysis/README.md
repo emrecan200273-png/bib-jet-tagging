@@ -20,6 +20,15 @@ gets the jet summaries and six features per cell: stored time, transformed
 relative energy, $R$, $z$, and the offsets in $\eta$ and $\phi$ from the jet. The stored
 `jet_BIB_score` is used for the comparison.
 
+The selection uses $p_T \geq 30$ GeV, $|\eta| < 1.7$, a Tile energy fraction
+strictly between 0 and 1, and `nPrimaryVertices == 0` for the cell-model
+unpaired sample. The delayed region uses `jet_time_ATLAS > 3` ns. All jets
+from an event stay together in the 60/20/20 train/validation/test split.
+
+ROOT stores momenta in MeV, positions in mm and times in ns. The models use
+the original stored cell times. The loader keeps cells with positive energy
+and finite values that differ from the missing-value sentinel.
+
 ## Prepare the vertex counts
 
 The separate vertex files use the `BIB` tree. Match them to the cell files by
@@ -30,7 +39,7 @@ reconstructed vertices and keep the original event splits.
 python -m pip install 'torch>=2.5,<3'
 
 ppp_unpaired_dir="${PPP_DATA_ROOT:-DataForEmre}/non_collision/unpaired"
-python analysis/match_unpaired_vertices.py \
+python -m analysis.data.match_unpaired_vertices \
   "$ppp_unpaired_dir/physics_Background_NTuple" \
   "$ppp_unpaired_dir/user.ezaya.UNPAIRED_nPV_nocells.EXT0" \
   --cell-tree JetContent --vertex-tree BIB --vertex-branch nPrimaryVertices \
@@ -38,17 +47,17 @@ python analysis/match_unpaired_vertices.py \
   --vertex-key-branches runNumber eventNumber lumiBlockNumber \
   --matched-only --output-dir analysis/outputs/unpaired_vertex_match
 
-python analysis/train_xgboost_vertex.py
+python -m analysis.training.train_xgboost_vertex
 ```
 
 ## Train with cells
 
 ```bash
-python analysis/train_cell_models.py
-python analysis/train_cell_models.py --all-cells --threads 4
-python analysis/train_pairwise_cells.py
-python analysis/train_pairwise_cells.py --particle-net-lite
-python analysis/train_pairwise_cells.py --deep-transformers
+python -m analysis.training.train_cell_models
+python -m analysis.training.train_cell_models --all-cells --threads 4
+python -m analysis.training.train_pairwise_cells
+python -m analysis.training.train_pairwise_cells --particle-net-lite
+python -m analysis.training.train_pairwise_cells --deep-transformers
 ```
 
 The first command trains a jet-level MLP and runs Deep Sets and a small
@@ -60,12 +69,12 @@ The delayed region uses `jet_time_ATLAS > 3` ns.
 
 ## Set Transformer and Cluster Transformer
 
-- [ParT](part_cell_model.py) uses attention between pairs of cells, with
+- [ParT](models/part_cell_model.py) uses attention between pairs of cells, with
   information about each pair in the attention weights.
-- [Set Transformer](set_cell_transformer.py) lets cells exchange information
+- [Set Transformer](models/set_cell_transformer.py) lets cells exchange information
   through eight learned summaries per block. This avoids comparing every
   cell pair. [Set Transformer paper](https://proceedings.mlr.press/v97/lee19d.html)
-- [Cluster Transformer](cluster_cell_transformer.py) pools cells within each
+- [Cluster Transformer](models/cluster_cell_transformer.py) pools cells within each
   stored ATLAS topocluster, then runs attention across the clusters in the jet.
   The grouping comes from `jet_n_clusters` and `cluster_n_cells`.
 
@@ -95,8 +104,8 @@ same test split from one unpaired run and one LLP signal sample.
 Run the two alternatives after training ParT.
 
 ```bash
-python analysis/train_pairwise_cells.py --set-transformer
-python analysis/train_pairwise_cells.py --cluster-transformer
+python -m analysis.training.train_pairwise_cells --set-transformer
+python -m analysis.training.train_pairwise_cells --cluster-transformer
 ```
 
 Results are written to `analysis/outputs/set_transformer_comparison/` and
@@ -107,19 +116,19 @@ curve and `kinematic_bins_delayed_cut.csv` for shared $p_T$ and |η| bins.
 
 | Script | What it checks |
 | --- | --- |
-| [study_jet_acceptance.py](study_jet_acceptance.py) | How the $p_T$, η and Tile cuts affect the samples and timing baseline |
-| [study_unpaired_runs.py](study_unpaired_runs.py) | How jet-level timing and kinematic controls transfer to other runs without cell input |
-| [study_bib_profiles.py](study_bib_profiles.py) | How the stored timing score compares with fits that try both beam directions |
-| [study_cell_inputs.py](study_cell_inputs.py) | How ParT responds when cell times are shuffled within each jet |
-| [compare_part_emil.py](compare_part_emil.py) | How frozen ParT and Emil scores compare on the same jets |
+| [study_jet_acceptance.py](studies/study_jet_acceptance.py) | How the $p_T$, η and Tile cuts affect the samples and timing baseline |
+| [study_unpaired_runs.py](studies/study_unpaired_runs.py) | How jet-level timing and kinematic controls transfer to other runs without cell input |
+| [study_bib_profiles.py](studies/study_bib_profiles.py) | How the stored timing score compares with fits that try both beam directions |
+| [study_cell_inputs.py](studies/study_cell_inputs.py) | How ParT responds when cell times are shuffled within each jet |
+| [compare_part_emil.py](studies/compare_part_emil.py) | How frozen ParT and Emil scores compare on the same jets |
 
 Run the cell-input check after training ParT. Run the BIB profile study before
 the same-jet comparison so it can read the stored score cut. The comparison
 also reports results in shared $p_T$ and |η| bins and in the 3–10 ns window.
 
 ```bash
-python analysis/study_bib_profiles.py
-python analysis/compare_part_emil.py
+python -m analysis.studies.study_bib_profiles
+python -m analysis.studies.compare_part_emil
 ```
 
 The same-jet table and score counts go to
@@ -136,4 +145,4 @@ against the full event IDs in the cell files.
 - Which Athena release and export flags produced `physics_Background_NTuple_unsplit_v2`?
 - Which unpaired trigger selection should we apply consistently across runs `484258` and `486706`?
 
-See [model options](model_options.md) for notes on the papers.
+See [model options](models/README.md) for notes on the papers.

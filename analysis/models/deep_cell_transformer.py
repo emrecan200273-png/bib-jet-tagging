@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from cell_models import attention_key_mask, jet_classifier
+from analysis.models.cell_models import attention_key_mask, jet_classifier
 
 
 WIDTH = 32

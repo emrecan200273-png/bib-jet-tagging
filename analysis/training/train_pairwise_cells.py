@@ -5,14 +5,16 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 
-import train_cell_models as pilot
-from cell_generalization import plot_learning_curves, summarize_generalization
-from cell_jet_data import CELL_FEATURES, extract_cells
-from cell_models import restore_model
-from data_paths import resolve_data_paths
-from train_xgboost import write_json
-from train_xgboost_vertex import kinematic_comparison, load_jets, make_comparison_plot, paired_interval, population
-from xgb_evaluation import jet_time_regions
+from analysis import PROJECT_ROOT
+
+import analysis.training.train_cell_models as pilot
+from analysis.evaluation.cell_generalization import plot_learning_curves, summarize_generalization
+from analysis.data.cell_jet_data import CELL_FEATURES, extract_cells
+from analysis.models.cell_models import restore_model
+from analysis.data.data_paths import resolve_data_paths
+from analysis.training.train_xgboost import write_json
+from analysis.training.train_xgboost_vertex import kinematic_comparison, load_jets, make_comparison_plot, paired_interval, population
+from analysis.evaluation.xgb_evaluation import jet_time_regions
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +30,36 @@ CLUSTER = "cluster_transformer"
 DISPLAY_NAMES = {REFERENCE: "Transformer", PAIRWISE: "ParT-inspired", PARTICLE_NET: "ParticleNet-Lite",
                  DEEP: "Two-block Transformer", BIB: "Two-block Transformer + BIB profile",
                  SET: "Set Transformer", CLUSTER: "Cluster Transformer"}
+# Each choice lists its output folder, saved models to compare against, and models to train.
+COMPARISONS = {
+    PAIRWISE: ("pairwise_cell_comparison", (REFERENCE,), (PAIRWISE,)),
+    PARTICLE_NET: ("particle_net_lite_comparison", (REFERENCE, PAIRWISE), (PARTICLE_NET,)),
+    DEEP: ("deep_cell_transformer_comparison", (PAIRWISE,), (DEEP, BIB)),
+    SET: ("set_transformer_comparison", (PAIRWISE,), (SET,)),
+    CLUSTER: ("cluster_transformer_comparison", (PAIRWISE,), (CLUSTER,)),
+}
 PARTICLE_NET_BATCH_CELLS = 8192
+
+
+def _paired_changes(test, test_scores, cuts, delayed_cuts, seed, references, trained):
+    pairs = [(reference, name) for reference in references for name in trained]
+    if trained == (DEEP, BIB):
+        pairs.append((DEEP, BIB))
+    labels = {
+        (reference if trained == (PARTICLE_NET,) else f"{name}_minus_{reference}"): (reference, name)
+        for reference, name in pairs
+    }
+    changes = {}
+    for region, subset, thresholds in pilot.evaluation_regions(test, cuts, delayed_cuts):
+        frame = test.loc[subset]
+        scores = {name: score[subset] for name, score in test_scores.items()}
+        differences = {key: {
+            "llp_kept": paired_interval(frame, scores, thresholds, 0, seed, model_names=pair),
+            "unpaired_tagged": paired_interval(frame, scores, thresholds, 1, seed, model_names=pair),
+        } for key, pair in labels.items()}
+        # Keep the direct metric keys for reports that compare just two models.
+        changes[region] = next(iter(differences.values())) if len(pairs) == 1 else differences
+    return changes
 
 
 def run_comparison(project_root, threads, architecture, output_override=None):
@@ -37,24 +68,10 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     graph = architecture == PARTICLE_NET
     deep = architecture == DEEP
     advanced = architecture in (SET, CLUSTER)
-    if advanced:
-        references, trained = (PAIRWISE,), (architecture,)
-        previous_dir = outputs / "pairwise_cell_comparison"
-        output_dir = outputs / f"{architecture}_comparison"
-    elif deep:
-        references, trained = (PAIRWISE,), (DEEP, BIB)
-        previous_dir = outputs / "pairwise_cell_comparison"
-        output_dir = outputs / "deep_cell_transformer_comparison"
-    elif graph:
-        references, trained = (REFERENCE, PAIRWISE), (PARTICLE_NET,)
-        previous_dir = outputs / "pairwise_cell_comparison"
-        output_dir = outputs / "particle_net_lite_comparison"
-    else:
-        references, trained = (REFERENCE,), (PAIRWISE,)
-        previous_dir = outputs / "cell_model_full_comparison"
-        output_dir = outputs / "pairwise_cell_comparison"
-    if output_override is not None:
-        output_dir = Path(output_override).resolve()
+    folder, references, trained = COMPARISONS[architecture]
+    previous_folder = "cell_model_full_comparison" if architecture == PAIRWISE else COMPARISONS[PAIRWISE][0]
+    previous_dir = outputs / previous_folder
+    output_dir = outputs / folder if output_override is None else Path(output_override).resolve()
     names = {name: DISPLAY_NAMES[name] for name in (*references, *trained)}
     previous_report = previous_dir / "metrics.json"
     previous_predictions = previous_dir / "test_predictions.csv.gz"
@@ -87,10 +104,9 @@ def run_comparison(project_root, threads, architecture, output_override=None):
 
     torch.set_num_threads(threads)
     print(f"Extracting all cells for {len(jets):,} jets", flush=True)
-    if architecture == CLUSTER:
-        cells, mask, audit, cluster_ids = extract_cells(jets, data_root, None, with_cluster_ids=True)
-    else:
-        cells, mask, audit = extract_cells(jets, data_root, None)
+    cells, mask, audit, *cluster_ids = extract_cells(
+        jets, data_root, None, with_cluster_ids=architecture == CLUSTER,
+    )
     if (audit["overall"]["truncated_jets"] or audit["overall"]["retained_cells"]
             != previous["cell_extraction"]["overall"]["retained_cells"]):
         raise ValueError("The extracted cell count differs from the saved comparison")
@@ -99,12 +115,8 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     scaling = previous["scaling_fit_on_train"]
     scalars = pilot.apply_scaling(jets[jet_features].to_numpy(dtype=np.float32), cells, mask, scaling)
     cell_features = list(CELL_FEATURES)
-    if architecture == CLUSTER:
-        grouped_cells = np.empty((*cells.shape[:2], cells.shape[-1] + 1), dtype=np.float32)
-        grouped_cells[..., :-1] = cells
-        grouped_cells[..., -1] = cluster_ids
-        cells = grouped_cells
-        del grouped_cells, cluster_ids
+    if cluster_ids:
+        cells = np.concatenate((cells, cluster_ids.pop()[..., None]), axis=-1, dtype=np.float32)
         cell_features.append("cluster_index")
     inputs = tuple(torch.from_numpy(array) for array in (scalars, cells, mask))
     lengths = inputs[2].sum(dim=1)
@@ -156,23 +168,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
             raise AssertionError(f"Reloaded model predictions differ for {name}")
 
     comparisons, results = pilot.compare_test_scores(test_frame, test_scores, cuts, delayed_cuts, seed)
-    pairs = [(reference, name) for reference in references for name in trained]
-    if deep:
-        pairs.append((DEEP, BIB))
-    paired = {}
-    for region, subset, thresholds in pilot.evaluation_regions(test_frame, cuts, delayed_cuts):
-        scores = {name: score[subset] for name, score in test_scores.items()}
-        differences = {(reference, name): {metric: paired_interval(
-            test_frame.loc[subset], scores, thresholds, label, seed, model_names=(reference, name),
-        ) for label, metric in [(0, "llp_kept"), (1, "unpaired_tagged")]} for reference, name in pairs}
-        if deep:
-            paired[region] = {f"{name}_minus_{reference}": stats for (reference, name), stats in differences.items()}
-        elif advanced:
-            paired[region] = differences[(PAIRWISE, architecture)]
-        elif graph:
-            paired[region] = {reference: differences[(reference, PARTICLE_NET)] for reference in references}
-        else:
-            paired[region] = differences[(REFERENCE, PAIRWISE)]
+    paired = _paired_changes(test_frame, test_scores, cuts, delayed_cuts, seed, references, trained)
     fields = [*identity, "sample", "label", "vertex_count", "jet_time_ATLAS", "jet_pt_GeV", "jet_abs_eta"]
     predictions = test_frame[fields].copy()
     for name, score in test_scores.items():
@@ -180,6 +176,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         predictions[f"{name}_tagged"] = score >= cuts[name]
     train_frame = jets.iloc[indices["train"].numpy()]
     bins, kinematic = kinematic_comparison(train_frame, predictions, model_names=names)
+    tables = {"test_predictions.csv.gz": predictions, "kinematic_bins.csv": bins, "results.csv": results}
     report = {
         "inputs_sha256": hashes, "population": population(jets), "cell_extraction": audit,
         "jet_features": jet_features, "cell_features": cell_features,
@@ -202,11 +199,10 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         delayed_bins, delayed_kinematic = kinematic_comparison(
             train_frame, delayed_predictions, model_names=names, region_masks=delayed_masks,
         )
-        delayed_bins.to_csv(output_dir / "kinematic_bins_delayed_cut.csv", index=False)
+        tables["kinematic_bins_delayed_cut.csv"] = delayed_bins
         report["kinematic_comparison_at_delayed_validation_cut"] = delayed_kinematic
-    predictions.to_csv(output_dir / "test_predictions.csv.gz", index=False)
-    bins.to_csv(output_dir / "kinematic_bins.csv", index=False)
-    results.to_csv(output_dir / "results.csv", index=False)
+    for filename, table in tables.items():
+        table.to_csv(output_dir / filename, index=False)
     make_comparison_plot(results, output_dir / "comparison.png", names, "Cell models on the same test jets")
     plot_learning_curves({names[name]: histories[name] for name in names}, output_dir / "learning_curves.png")
     write_json(output_dir / "metrics.json", report)
@@ -215,7 +211,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--output-dir", type=Path, help="Write this run to a separate output folder")
     models = parser.add_mutually_exclusive_group()

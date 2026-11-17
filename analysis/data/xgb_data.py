@@ -17,7 +17,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import uproot
 
-from data_paths import resolve_data_paths
+from analysis.data.data_paths import resolve_data_paths
 
 
 PHYSICS_FEATURES = [
@@ -154,6 +154,57 @@ def _numeric_vector(arrays, field, jet_counts, context):
     return ak.to_numpy(ak.flatten(arrays[field], axis=1), allow_missing=True)
 
 
+def read_jet_fields(arrays, jet_counts, context, *, sanitation=None, sample=None):
+    """Check vector sizes and replace invalid jet values with NaN."""
+    clean = {}
+    for field in JET_BRANCHES:
+        raw = _numeric_vector(arrays, field, jet_counts, context)
+        values = sanitize_values(raw)
+        invalid = physical_invalid_mask(field, values)
+        values[invalid] = np.nan
+        if sanitation is not None:
+            raw_floats = np.ma.asarray(raw, dtype=np.float64).filled(np.nan)
+            sanitation.setdefault((sample, field), Counter()).update({
+                "values": len(values),
+                "sentinel": int((raw_floats == INVALID_VALUE).sum()),
+                "nonfinite": int((~np.isfinite(raw_floats)).sum()),
+                "physical_invalid": int(invalid.sum()),
+                "missing_after_sanitizing": int(np.isnan(values).sum()),
+            })
+        clean[field] = values
+    return clean
+
+
+def apply_jet_cuts(clean, keep, flow, *, min_pt_GeV, max_abs_eta, require_mixed):
+    """Update the mask and counts after each standard acceptance cut."""
+    pt = clean["jet_pt"] / 1000.0
+    eta = clean["jet_eta"]
+    choices = (
+        ("finite_pt_eta_time", np.isfinite(pt) & np.isfinite(eta) & np.isfinite(clean["jet_time_ATLAS"])),
+        ("pt_cut", pt >= min_pt_GeV),
+        ("eta_cut", np.abs(eta) < max_abs_eta),
+        ("mixed_calorimeters" if require_mixed else "valid_tile_fraction",
+         tile_fraction_mask(clean["jet_TileEnergyFrac"], require_mixed=require_mixed)),
+    )
+    for stage, condition in choices:
+        keep &= condition
+        flow[stage] += int(keep.sum())
+    return pt
+
+
+def selected_jet_frame(clean, pt, keep, counts, rows, keys, source, *, sample, label, split=None):
+    """Keep the original ROOT row and within-event jet index."""
+    jet_index = np.arange(len(pt)) - np.repeat(np.cumsum(counts) - counts, counts)
+    return pd.DataFrame({
+        "label": label, "sample": sample,
+        **({"split": split} if split is not None else {}),
+        "event_group": np.repeat(keys, counts)[keep], "source_file": source,
+        "row_index": np.repeat(rows, counts)[keep], "jet_index": jet_index[keep],
+        "jet_pt_GeV": pt[keep], "jet_eta": clean["jet_eta"][keep], "jet_abs_eta": np.abs(clean["jet_eta"][keep]),
+        **{field: clean[field][keep] for field in (*PHYSICS_FEATURES, "jet_BIB_score")},
+    })
+
+
 def prepare_training_data(
     project_root, output_dir, *, seed=42, min_pt_GeV=30., max_abs_eta=1.7,
     verify_hashes=True, require_mixed_calorimeters=True,
@@ -232,23 +283,7 @@ def prepare_training_data(
                         raise ValueError(f"Duplicate physical event row: {key} in {relative}")
                     seen_events[sample].add(key)
                 full_events[sample] += len(arrays)
-                clean = {}
-                for field in JET_BRANCHES:
-                    raw = _numeric_vector(arrays, field, jet_counts, context)
-                    values = sanitize_values(raw)
-                    key = (sample, field)
-                    counts = sanitation.setdefault(key, Counter())
-                    raw_floats = np.ma.asarray(raw, dtype=np.float64).filled(np.nan)
-                    counts.update({
-                        "values": len(values),
-                        "sentinel": int(np.count_nonzero(raw_floats == INVALID_VALUE)),
-                        "nonfinite": int(np.count_nonzero(~np.isfinite(raw_floats))),
-                    })
-                    invalid = physical_invalid_mask(field, values)
-                    counts["physical_invalid"] += int(invalid.sum())
-                    values[invalid] = np.nan
-                    counts["missing_after_sanitizing"] += int(np.isnan(values).sum())
-                    clean[field] = values
+                clean = read_jet_fields(arrays, jet_counts, context, sanitation=sanitation, sample=sample)
                 if sample == "LLP":
                     truth = sanitize_values(
                         _numeric_vector(arrays, "jet_is_llp_matched", jet_counts, context)
@@ -261,30 +296,12 @@ def prepare_training_data(
                 flow = cutflow[sample]
                 flow["all_jets"] += n_jets
                 flow["truth_selection"] += int(keep.sum())
-                pt_GeV = clean["jet_pt"] / 1000.
-                keep &= np.isfinite(pt_GeV) & np.isfinite(clean["jet_eta"]) & np.isfinite(clean["jet_time_ATLAS"])
-                flow["finite_pt_eta_time"] += int(keep.sum())
-                keep &= pt_GeV >= min_pt_GeV
-                flow["pt_cut"] += int(keep.sum())
-                keep &= np.abs(clean["jet_eta"]) < max_abs_eta
-                flow["eta_cut"] += int(keep.sum())
-                keep &= tile_fraction_mask(clean["jet_TileEnergyFrac"], require_mixed=require_mixed_calorimeters)
-                flow[calorimeter_stage] += int(keep.sum())
+                pt = apply_jet_cuts(clean, keep, flow, min_pt_GeV=min_pt_GeV, max_abs_eta=max_abs_eta,
+                                    require_mixed=require_mixed_calorimeters)
                 if keep.any():
-                    rows = np.repeat(np.arange(file_events, file_events + len(arrays)), jet_counts)
-                    offsets = np.repeat(np.cumsum(jet_counts) - jet_counts, jet_counts)
-                    jet_indices = np.arange(n_jets) - offsets
-                    data = {
-                        "label": label, "sample": sample,
-                        "event_group": np.repeat(event_keys, jet_counts)[keep],
-                        "source_file": relative, "row_index": rows[keep],
-                        "jet_index": jet_indices[keep], "jet_pt_GeV": pt_GeV[keep],
-                        "jet_eta": clean["jet_eta"][keep],
-                        "jet_abs_eta": np.abs(clean["jet_eta"][keep]),
-                        **{field: clean[field][keep] for field in PHYSICS_FEATURES},
-                        "jet_BIB_score": clean["jet_BIB_score"][keep],
-                    }
-                    parts.append(pd.DataFrame(data))
+                    rows = np.arange(file_events, file_events + len(arrays))
+                    parts.append(selected_jet_frame(clean, pt, keep, jet_counts, rows, event_keys, relative,
+                                                    sample=sample, label=label))
                 file_events += len(arrays)
                 file_jets += n_jets
                 file_selected += int(keep.sum())
