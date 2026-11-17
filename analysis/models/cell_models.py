@@ -1,6 +1,7 @@
-"""Small classifiers with shared jet inputs and optional calorimeter cells.
+"""Jet classifiers, with or without cell inputs.
 
-All models return one logit per jet. A True mask entry marks a real cell.
+Inputs are [jets, features] and [jets, cells, features]. True marks a real cell.
+Each model returns one logit per jet; sigmoid turns it into a BIB score.
 """
 
 import torch
@@ -12,7 +13,7 @@ DROPOUT = 0.1
 
 
 def jet_classifier(input_dim, dropout=DROPOUT):
-    """Build the shared classifier head for the MLP, set and attention models."""
+    """Turn a jet summary into one score before sigmoid."""
     return nn.Sequential(
         nn.Linear(input_dim, 64),
         nn.SiLU(),
@@ -25,7 +26,7 @@ def jet_classifier(input_dim, dropout=DROPOUT):
 
 
 def attention_key_mask(valid):
-    """Keep a temporary attention key for a row with no valid cells."""
+    """Avoid an all-masked attention row; its pooled result is later zeroed."""
     empty = ~valid.any(dim=1, keepdim=True)
     first = torch.arange(valid.shape[1], device=valid.device).eq(0).unsqueeze(0)
     return valid | (empty & first), empty
@@ -41,6 +42,8 @@ class JetMLP(nn.Module):
 
 
 class DeepSets(nn.Module):
+    """Read each cell, then join the mean and maximum cell summaries."""
+
     def __init__(self, jet_dim, cell_dim):
         super().__init__()
         self.cell_encoder = nn.Sequential(
@@ -66,6 +69,8 @@ class DeepSets(nn.Module):
 
 
 class CellTransformer(nn.Module):
+    """Let cells exchange information and collect it in one summary token."""
+
     def __init__(self, jet_dim, cell_dim):
         super().__init__()
         self.cell_projection = nn.Linear(cell_dim, WIDTH)
@@ -89,7 +94,7 @@ class CellTransformer(nn.Module):
 
 
 def build_model(name, jet_dim, cell_dim, **options):
-    """Build a classifier consuming (jets, padded cells, valid-cell mask)."""
+    """Select a model that accepts (jets, cells, mask)."""
     if name == "jet_mlp":
         return JetMLP(jet_dim)
     if name == "deep_sets":

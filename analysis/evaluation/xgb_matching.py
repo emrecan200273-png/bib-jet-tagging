@@ -1,7 +1,6 @@
-"""A secondary, conditional comparison with equal pT/eta-bin class counts.
+"""Compare equal numbers of LLP and unpaired jets in pT/eta bins.
 
-This reduces obvious sample-spectrum differences. It is not a replacement for
-independent-run or data/MC validation, and finite bins leave residual differences.
+Jets can still differ within a bin. A separate test run is still needed.
 """
 import numpy as np
 import pandas as pd
@@ -56,12 +55,11 @@ def overlap_weights(frame, support):
 
 
 def match_kinematics(frame, *, seed=42):
-    """Return a matched copy and audit while preserving original event splits.
+    """Keep equal class counts in each bin, without changing event splits.
 
-    Training alone defines supported bins (at least three jets of each class).
-    Within each supported bin and each existing split, independently draw the
-    smaller class count from each class without replacement. Neither model
-    scores nor timing/shower features are read to select rows.
+    Training defines the bins: at least three jets per class. Each split then
+    samples the smaller class count from both classes, without replacement.
+    Selection uses pT and eta, not scores or timing.
     """
     required = {
         "label", "split", "event_group", "source_file", "jet_index",

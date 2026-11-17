@@ -1,8 +1,7 @@
-"""ParticleNet-Lite adapted to variable-size sets of calorimeter cells.
+"""ParticleNet-Lite adapted to calorimeter cells.
 
-The two EdgeConv blocks rebuild their neighbor graphs and use per-edge
-LayerNorm in place of BatchNorm, so padding and microbatch composition do
-not enter normalization statistics. True mask entries mark real cells.
+Each block links cells to nearby cells. LayerNorm acts on each edge, so
+padding and batch size do not affect normalization. True marks a real cell.
 """
 
 import math
@@ -78,8 +77,8 @@ class _EdgeConv(nn.Module):
             edges = self.edge_mlp(torch.cat((centers, neighbors - centers), dim=-1))
             pooled = edges.new_zeros((batch * count, edges.shape[-1]))
             pooled.index_add_(0, batch_idx * count + center_idx, edges)
-            denom = valid_edges.sum(dim=-1, keepdim=True).clamp_min(1)
-            shortcut = shortcut + pooled.reshape_as(shortcut) / denom
+            neighbor_count = valid_edges.sum(dim=-1, keepdim=True).clamp_min(1)
+            shortcut = shortcut + pooled.reshape_as(shortcut) / neighbor_count
         return self.activation(shortcut).masked_fill(~valid.unsqueeze(-1), 0)
 
 
@@ -112,8 +111,7 @@ class ParticleNetLiteCells(nn.Module):
             order = _canonical_cell_order(features, valid)
             valid = valid.gather(1, order)
             features = features.gather(1, order.unsqueeze(-1).expand_as(features))
-            # Only differences enter the first graph, so restoring the scales
-            # (without the training centers) recovers physical angle distances.
+            # Undo angle scaling. A common offset cancels in angle differences.
             angles = features[..., 4:6] * self.angular_scale
             graph = _neighbors(angles, valid, self.k, angular=True)
             features = self.edge_conv_1(features, valid, *graph)

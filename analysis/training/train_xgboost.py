@@ -1,8 +1,7 @@
-"""Train and evaluate a first, event-separated BIB/LLP XGBoost baseline.
+"""Train XGBoost on unpaired data and LLP simulation.
 
-This is a comparison of one BIB-enriched data sample and one LLP simulation,
-inside a common selection. It is not a calibrated probability or a measurement
-of detector-wide BIB rejection. All thresholds are chosen on validation only.
+Events stay in one split. Score cuts are chosen on validation jets.
+Results describe these samples; scores are not physical probabilities.
 """
 
 import argparse
@@ -97,11 +96,10 @@ def _save_and_verify_model(model, path, frame, features, expected_scores, error)
 
 
 def score_saved_model(frame, output_dir):
-    """Score selected, flattened jet rows with the saved main model.
+    """Score one row per jet with the saved model.
 
-    The output includes an acceptance mask: out-of-selection jets have NaN
-    scores, rather than silently receiving an unsupported decision. Required
-    momenta are in GeV, eta is dimensionless, and stored timing is in ns.
+    Jets outside the selection get NaN scores and missing tags.
+    Input units are GeV for momentum and ns for time; eta has no unit.
     """
     output_dir = Path(output_dir)
     schema = json.loads((output_dir / "feature_schema.json").read_text())
@@ -262,7 +260,7 @@ def _reference_comparison(test, validation, model_scores, main_threshold, target
             for label, name in [(0, "LLP"), (1, "BIB")]
         },
         "definition": "Higher stored score is more BIB-like; -999999/nonfinite values are missing.",
-        "fairness": "Both methods use the same valid-score validation and test subsets. This comparison has a separate validation cut; the primary model cut stays frozen elsewhere.",
+        "fairness": "Both methods use the same jets with valid scores and separate validation cuts. The main model cut is unchanged.",
     }
     if (not val_mask.any() or not test_mask.any()
             or validation.loc[val_mask].label.nunique() != 2
@@ -304,11 +302,9 @@ def _reference_comparison(test, validation, model_scores, main_threshold, target
 
 
 def _matched_check(frame, params, output_dir, *, seed, target, selection):
-    """An exploratory conditional check, after the initial sample comparison.
+    """Repeat training with balanced class counts in shared pT/|eta| bins.
 
-    Kinematic matching never uses scores or timing and never moves an event
-    between splits. It changes the evaluated population, so its rates are
-    reported separately rather than as replacements for the original test.
+    Keep event splits unchanged. This changes the sample, so report it separately.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     matched, audit = match_kinematics(frame, seed=seed)
@@ -357,7 +353,7 @@ def _matched_check(frame, params, output_dir, *, seed, target, selection):
     if not saved_scores.in_selection.all() or not np.array_equal(saved_scores.bib_score.to_numpy(), scores["XGBoost"]):
         raise AssertionError("Matched model inference disagrees with experiment predictions.")
     report = {
-        "scope": "Exploratory secondary check motivated by strong kinematic separation in the initial run; not an independent final validation.",
+        "scope": "Exploratory check after finding different pT/eta distributions; this reuses the test split.",
         "procedure": "Original event split retained. Train-supported fixed pT/|eta| bins, equal class counts per bin in each split. No timing or model-score matching.",
         "caveat": "Coarse-bin matching does not make the samples identical. Read the kinematics-only control and residual production/MC-data caveats.",
         "models": metrics, "matching_audit_file": "matching_audit.json",
@@ -385,11 +381,10 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
                   subsample=.8, colsample_bytree=1., reg_lambda=5., reg_alpha=0.,
                   objective="binary:logistic", eval_metric="logloss", tree_method="hist",
                   n_jobs=4, random_state=seed, base_score=.5)
-    # Fixed settings for this reproducible run. The no-sigma ablation and
-    # matching study are exploratory follow-ups to the initial three models.
+    # Fixed settings; extra feature and kinematic checks are exploratory.
     models, thresholds, histories, metrics, gain = _fit_models(train, validation, params, target_llp_keep, output_dir)
     scores = _test_models(test, models, thresholds, metrics, seed)
-    # Validation-only permutation checks avoid using test importance to tune the model.
+    # Shuffle one validation feature at a time to see how much AUC drops.
     perm = permutation_importance(models["XGBoost"], validation[MODEL_FEATURES["XGBoost"]],
                                   validation.label, scoring="roc_auc", n_repeats=8,
                                   random_state=seed, n_jobs=1)
@@ -417,7 +412,7 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
         "score_meaning": "BIB classifier score; not a calibrated physical probability", "missing": "-999999 and nonfinite -> NaN",
     }
     write_json(output_dir / "feature_schema.json", schema)
-    # Exercise the public, scope-checked inference path against the saved model.
+    # Check that loading the saved model gives the same scores.
     inference = score_saved_model(test, output_dir)
     if not inference.in_selection.all() or not np.array_equal(inference.bib_score.to_numpy(), scores["XGBoost"]):
         raise AssertionError("Saved inference wrapper disagrees with experiment predictions.")
@@ -428,17 +423,17 @@ def run_experiment(project_root, output_dir=None, *, seed=42, target_llp_keep=0.
         "models": metrics, "stored_tagger_comparison": comparison,
         "matched_kinematics": matched_report,
         "training_parameters": params, "early_stopping": {"rounds": EARLY_STOP_ROUNDS, "metric": "class-balanced validation logloss", "test_used": False},
-        "study_sequence": "Initial five-input, timing-only and kinematics-only models used fixed settings. After inspecting that comparison, bin balancing and the no-time-uncertainty ablation were added as exploratory diagnostics. No hyperparameter tuning or final model selection on the test was performed; further improvements need a fresh independent test.",
-        "weighting": "Training and early stopping use inverse training-class-frequency weights. Reported test jet fractions are unweighted and are not event rates.",
-        "uncertainty": "Event-bootstrap test-rate intervals hold fitted model and validation threshold fixed. They exclude training/threshold/purity and data-MC uncertainty.",
+        "study_sequence": "The first run compared five inputs, timing only and kinematics only. Bin balancing and dropping time uncertainty were later checks. Settings stayed fixed; future model choices need a new test sample.",
+        "weighting": "Training and early stopping balance the classes using training counts. Test jet fractions are unweighted, not event rates.",
+        "uncertainty": "Intervals resample test events with the model and cut fixed. They exclude training, cut selection, sample purity and data/MC differences.",
         "limitations": [
-            "Unpaired is a working BIB label and can contain collision contamination; no n_vrtx branch is available for cleaning.",
-            "LLP truth matching is defined by upstream source; exact ntuple production commit still needs confirmation with Emil.",
-            "Both classes require mixed LAr/Tile calorimeter support. Results do not apply to excluded pure-calorimeter jets.",
-            "One LLP mass/lifetime and one unpaired run; event-separated test is not an independent run, mass or production test.",
-            "Signal and background have different momentum spectra and MC/data production. Removing explicit pT/eta does not remove all kinematic dependence.",
-            "No ordinary-collision evaluation: supplied ZMUMU files are AOD CollectionTree, not the JetContent ntuple used here.",
-            "No luminosity, trigger-efficiency or MC event weights; no detector-wide rejection or physical probability claim.",
+            "Unpaired is a working BIB label and may contain collisions. Vertex cleaning is a separate study.",
+            "LLP truth matching comes from the producer. Confirm the production commit with Emil.",
+            "Both classes require LAr and Tile energy; pure-calorimeter jets are excluded.",
+            "One LLP mass/lifetime and one unpaired run; no test on a new run or signal point.",
+            "LLP simulation and unpaired data have different momentum distributions. Dropping pT/eta inputs does not remove this difference.",
+            "Ordinary collision files use AOD CollectionTree, so this JetContent study does not evaluate them.",
+            "No luminosity, trigger or MC event weights; these fractions are not detector-wide rates.",
         ],
         "plots": [str(Path(p).relative_to(output_dir)) for p in plots],
         "versions": {pkg: version(pkg) for pkg in ["xgboost", "scikit-learn", "numpy", "pandas", "uproot", "awkward", "matplotlib", "scipy"]},

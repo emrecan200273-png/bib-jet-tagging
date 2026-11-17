@@ -1,9 +1,7 @@
-"""Evaluation for the BIB tagging feasibility study.
+"""Choose validation cuts and measure how many test jets pass.
 
-Labels are 1 = unpaired (BIB enriched), 0 = truth-matched LLP simulation.
-Unpaired labels are not verified BIB truth for every jet. A score at or above the
-threshold is tagged as BIB.  All rates below describe this selected sample,
-not ATLAS event rates or performance on collision data.
+Labels: 1 = unpaired, 0 = truth-matched LLP simulation. Unpaired is a working
+BIB label. Score >= cut means tagged as BIB. Rates apply to this sample only.
 """
 
 from pathlib import Path
@@ -48,13 +46,11 @@ def _inputs(y, scores):
 
 
 def choose_threshold(y, scores, target_llp_keep=0.95):
-    """Choose the smallest validation cut with the requested LLP keep fraction.
+    """Choose the lowest cut that keeps the target fraction of validation LLPs.
 
-    Keep means ``score < threshold``, so ties matter.  The cut is one floating
-    point step above the kth LLP score, with k = ceil(target * n_LLP).  This
-    gives at least the requested empirical keep fraction and maximizes BIB
-    tagging subject to that constraint.  A tied group can make keep exceed
-    the target.  Use validation data only; do not select a cut on test data.
+    Keep means score < cut. Set the cut just above the kth LLP score, where
+    k = ceil(target * n_LLP). Tied scores can make retention exceed the target.
+    Use validation jets only.
     """
     y, scores = _inputs(y, scores)
     if not np.isfinite(target_llp_keep) or not 0 < target_llp_keep <= 1:
@@ -107,10 +103,8 @@ def rates(frame, scores, threshold, weights=None):
 def _event_bootstrap(labels, tagged, groups, repeats, seed):
     """Estimate intervals by drawing whole events with replacement.
 
-    Each time an event is drawn, include all of its jets. In each draw, divide
-    the number of successful jets by the total for that class. Skip draws that
-    lack the class. If the observed rate is 0 or 1, the resampling cannot
-    create an unseen outcome, so omit that interval.
+    Include every jet of a drawn event. Skip draws with no jets of a class.
+    At rates of 0 or 1, resampling cannot show unseen outcomes: omit the interval.
     """
     if repeats == 0:
         return None, None
@@ -146,16 +140,12 @@ def _event_bootstrap(labels, tagged, groups, repeats, seed):
 
 
 def evaluate_scores(frame, scores, threshold, *, bootstrap_repeats=200, seed=42):
-    """Return JSON-safe jet-level metrics and event-bootstrap rate intervals.
+    """Return jet counts, rates and 95% intervals from resampling whole events.
 
-    ``event_group`` must identify the same physical event across all its jets
-    and be unique across unrelated source events.  Percentile 95% intervals
-    resample whole events (not independent jets).  They describe test-sample
-    sampling variation at a fixed validation threshold; they do not include
-    model training, threshold selection, label purity or data/MC uncertainty.
-    Intervals are omitted (None) for observed rates of exactly 0 or 1 because
-    empirical bootstrap resampling cannot bound outcomes absent from the data.
-    Average precision depends on the observed BIB fraction reported here.
+    event_group must uniquely identify each physical event. Intervals describe
+    this sample at a fixed cut, excluding training, cut, label and data/MC
+    uncertainty. Rates of 0 or 1 have no interval. Average precision depends
+    on the sample's BIB fraction.
     """
     required = {"label", "event_group"}
     missing = required - set(frame.columns)

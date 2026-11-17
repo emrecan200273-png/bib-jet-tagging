@@ -1,4 +1,4 @@
-"""Test jet selection and feature shortcuts while preserving existing event splits."""
+"""Test a lower pT cut, more calorimeter types, and timing-only inputs."""
 
 import argparse
 import json
@@ -34,8 +34,9 @@ def run_study(project_root):
     expanded["mixed"] = tile_fraction_mask(expanded["jet_TileEnergyFrac"], require_mixed=True)
     expanded["original"] = expanded["mixed"] & expanded["jet_pt_GeV"].ge(30)
     checked = [*JET_ID, "split", "label", "source_file", "row_index"]
-    frozen = expanded.loc[expanded["original"], checked]
-    if not frozen.sort_values(JET_ID).reset_index(drop=True).equals(old_clean[checked].sort_values(JET_ID).reset_index(drop=True)):
+    repeated_jets = expanded.loc[expanded["original"], checked].sort_values(JET_ID).reset_index(drop=True)
+    original_jets = old_clean[checked].sort_values(JET_ID).reset_index(drop=True)
+    if not repeated_jets.equals(original_jets):
         raise ValueError("Expanded extraction did not reproduce the original selected jets and splits")
     expanded = add_kinematic_bins(expanded)
     same_region = expanded.loc[expanded["original"]]
@@ -67,14 +68,14 @@ def run_study(project_root):
         print(f"Training {name} on {len(group_train):,} jets", flush=True)
         model = fit_booster(group_train, group_val, inputs, settings["training_parameters"],
                             settings["early_stopping"]["rounds"], train_w, val_w)
-        detail = {"features": inputs, "training_jets": len(group_train), "validation_jets": len(group_val),
-                  "trees": model.get_booster().num_boosted_rounds()}
-        details[name] = detail
-        val_s, test_s = (predict_model(model, frame, inputs) for frame in (val, test))
+        details[name] = {"features": inputs, "training_jets": len(group_train), "validation_jets": len(group_val),
+                         "trees": model.get_booster().num_boosted_rounds()}
+        validation_scores = predict_model(model, val, inputs)
+        test_scores = predict_model(model, test, inputs)
         if region:
-            val_s[~val[region].to_numpy()] = np.nan
-            test_s[~test[region].to_numpy()] = np.nan
-        scores[name] = val_s, test_s
+            validation_scores[~val[region].to_numpy()] = np.nan
+            test_scores[~test[region].to_numpy()] = np.nan
+        scores[name] = validation_scores, test_scores
 
     fixed_val_data = val.loc[fixed_val]
     cuts = {name: choose_threshold(fixed_val_data["label"], val_s[fixed_val], target) for name, (val_s, _) in scores.items()}
@@ -99,12 +100,18 @@ def run_study(project_root):
             weights = overlap_weights(sample, support)
             report["common_kinematics"][name][key] = rates(sample, score[mask], shared_cuts[name], weights)
         if name != "reference":
-            report["paired_fixed_test"][name] = {
-                key: {metric: paired_interval(original_test.loc[mask], {n: s[mask] for n, s in original_scores.items()},
-                                              cuts, label, seed, model_names=("reference", name))
-                      for metric, label in [("llp_kept", 0), ("unpaired_tagged", 1)]}
-                for key, mask in ((key, subset[fixed_test]) for key, subset in original_regions.items())
-            }
+            paired_results = {}
+            for region, mask in original_regions.items():
+                # The masks above span all expanded jets; this table has only the original jets.
+                original_mask = mask[fixed_test]
+                region_jets = original_test.loc[original_mask]
+                region_scores = {model: values[original_mask] for model, values in original_scores.items()}
+                paired_results[region] = {
+                    metric: paired_interval(region_jets, region_scores, cuts, label, seed,
+                                            model_names=("reference", name))
+                    for metric, label in [("llp_kept", 0), ("unpaired_tagged", 1)]
+                }
+            report["paired_fixed_test"][name] = paired_results
     report["selected_jet_counts"] = {
         name: population(frame)
         for name, frame in [("30_gev_mixed", same_region), ("15_gev_mixed", expanded.loc[expanded["mixed"]]),

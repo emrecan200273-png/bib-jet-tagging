@@ -1,8 +1,6 @@
-"""Small ParT-inspired attention model for calorimeter-cell sets.
+"""Small ParT-inspired model that compares pairs of cells.
 
-Cells are standardized with training-split statistics before entering the
-model. The mask is True for a real cell. No ordering or padding position is a
-model feature.
+Inputs are scaled using training data. True mask entries mark real cells.
 """
 
 import math
@@ -47,10 +45,9 @@ class PairwiseCellTransformer(nn.Module):
         self.classifier = jet_classifier(jet_dim + self.width, self.dropout)
 
     def _pair_bias(self, cells):
-        """Evaluate an MLP on signed differences without a pair-feature grid."""
+        """Score cell differences without storing every pair's feature vector."""
         batch, count, _ = cells.shape
-        # Projection commutes with subtraction. A common scale is applied to
-        # all standardized differences; these are not physical-unit distances.
+        # Project first, then subtract: W(x_i - x_j) = Wx_i - Wx_j.
         projected = self.pair_projection(cells[..., self.pair_features]) / math.sqrt(2.0)
         hidden_bias = self.pair_hidden_bias.to(projected.dtype)
         head_weights = self.pair_head_weights.to(projected.dtype)
@@ -70,8 +67,8 @@ class PairwiseCellTransformer(nn.Module):
             safe_cells = cells.masked_fill(~valid.unsqueeze(-1), 0)
             valid_keys, _ = attention_key_mask(valid)
 
-            x = self.cell_projection(safe_cells)
-            qkv = self.qkv(self.attention_norm(x)).reshape(batch, count, 3, self.heads, -1)
+            encoded = self.cell_projection(safe_cells)
+            qkv = self.qkv(self.attention_norm(encoded)).reshape(batch, count, 3, self.heads, -1)
             query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
             bias = self._pair_bias(safe_cells)
             bias.masked_fill_(~valid_keys[:, None, None, :], -torch.inf)
@@ -80,11 +77,11 @@ class PairwiseCellTransformer(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
             )
             attended = attended.transpose(1, 2).reshape(batch, count, self.width)
-            x = x + self.residual_dropout(self.attention_output(attended))
-            x = x + self.residual_dropout(self.feedforward(self.feedforward_norm(x)))
+            encoded = encoded + self.residual_dropout(self.attention_output(attended))
+            encoded = encoded + self.residual_dropout(self.feedforward(self.feedforward_norm(encoded)))
 
-            x = self.readout_norm(x)
-            logits = self.readout_score(x).squeeze(-1).masked_fill(~valid_keys, -torch.inf)
-            weights = logits.softmax(dim=1).masked_fill(~valid, 0)
-            pooled = (weights.unsqueeze(-1) * x).sum(dim=1)
+            encoded = self.readout_norm(encoded)
+            cell_logits = self.readout_score(encoded).squeeze(-1).masked_fill(~valid_keys, -torch.inf)
+            weights = cell_logits.softmax(dim=1).masked_fill(~valid, 0)
+            pooled = (weights.unsqueeze(-1) * encoded).sum(dim=1)
         return self.classifier(torch.cat((jets, pooled), dim=-1)).squeeze(-1)

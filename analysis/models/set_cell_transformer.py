@@ -1,7 +1,6 @@
-"""Set Transformer with two induced attention blocks and one pooling seed.
+"""Set Transformer: cells exchange information through eight learned summaries.
 
-Every valid cell participates, with no order or padding position as input.
-Learned queries let each block summarize the full set in eight vectors.
+Two blocks use every valid cell. One final query summarizes the jet.
 """
 
 import torch
@@ -19,7 +18,7 @@ DROPOUT = 0.1
 
 
 class _AttentionBlock(nn.Module):
-    """Cross-attention with residual, normalization and a per-token MLP."""
+    """Let queries read the context, then update each query."""
 
     def __init__(self):
         super().__init__()
@@ -62,7 +61,7 @@ class _InducedAttention(nn.Module):
 
 
 class SetCellTransformer(nn.Module):
-    """Encode cell interactions through eight inducing points per block."""
+    """Use eight learned queries instead of comparing every cell pair."""
 
     def __init__(self, jet_dim, cell_dim):
         super().__init__()

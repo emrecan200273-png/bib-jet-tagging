@@ -148,19 +148,21 @@ def _read_chunk(tree, subset, relative, max_cells, with_cluster_ids):
         total_energy = energies.sum()
         if not np.isfinite(total_energy):
             raise ValueError(f"Nonfinite energy sum for jet table row {i}: {relative}")
-        top = np.argsort(-energies, kind="stable")[:max_cells]
-        e, t, x, y, z, d_eta, d_phi = valid_cells[top].T
-        e_fraction = e / total_energy
-        features = np.column_stack((t, np.log1p(100.0 * e_fraction), np.hypot(x, y) / 1000.0,
-                                    z / 1000.0, d_eta, d_phi)).astype(np.float32)
+        energy_order = np.argsort(-energies, kind="stable")[:max_cells]
+        energy, time, x, y, z, d_eta, d_phi = valid_cells[energy_order].T
+        energy_fraction = energy / total_energy
+        features = np.column_stack((
+            time, np.log1p(100.0 * energy_fraction), np.hypot(x, y) / 1000.0,
+            z / 1000.0, d_eta, d_phi,
+        )).astype(np.float32)
         if not np.isfinite(features).all():
             raise ValueError(f"Nonfinite cell features for jet table row {i}: {relative}")
         local_ids = None
         if cluster_of_cell is not None:
-            cluster_ids = cluster_of_cell[start:stop][valid][top]
+            cluster_ids = cluster_of_cell[start:stop][valid][energy_order]
             _, local_ids = np.unique(cluster_ids, return_inverse=True)
             local_ids = local_ids.astype(np.int32, copy=False)
-        yield i, len(jet_cells), len(valid_cells), e_fraction.sum(), features, local_ids
+        yield i, len(jet_cells), len(valid_cells), energy_fraction.sum(), features, local_ids
 
 
 def _quantiles(values):

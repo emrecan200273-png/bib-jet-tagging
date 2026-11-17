@@ -1,4 +1,4 @@
-"""Check cell-count and cell-time shortcuts against the saved ParT model."""
+"""Check whether ParT uses cell timing or mainly the number of cells."""
 
 import argparse
 import json
@@ -31,13 +31,15 @@ def run_diagnostics(root):
     jets = clean.loc[clean["split"].isin(["validation", "test"])].reset_index(drop=True)
     model, inputs, audit = prepare_part(jets, data_root, checkpoint, settings["threads"])
     indices = {split: np.flatnonzero(jets["split"].eq(split)) for split in ("validation", "test")}
-    val, test = (jets.iloc[indices[split]] for split in indices)
-    test_idx = torch.from_numpy(indices["test"])
-    lengths = inputs[2].sum(1)
-    counts = lengths.numpy()
+    validation = jets.iloc[indices["validation"]]
+    test = jets.iloc[indices["test"]]
+    test_indices = torch.from_numpy(indices["test"])
+    cells_per_jet = inputs[2].sum(1)
+    counts = cells_per_jet.numpy()
 
     def score():
-        return predict_logits(model, inputs, test_idx, batch_size, lengths).sigmoid().numpy().astype(np.float64)
+        logits = predict_logits(model, inputs, test_indices, batch_size, cells_per_jet)
+        return logits.sigmoid().numpy().astype(np.float64)
 
     reference = pd.read_csv(saved / "test_predictions.csv.gz")
     original_scores = check_part_replay(test, reference, score())
@@ -46,14 +48,15 @@ def run_diagnostics(root):
     times = inputs[1].numpy()[:, :, CELL_FEATURES.index("cell_time_ns")]
     shuffled = {}
     original_times = times.copy()
+    # Change which time belongs to which cell, keeping all other inputs fixed.
     for repeat in range(3):
         for index in indices["test"]:
-            length = counts[index]
-            times[index, :length] = rng.permutation(original_times[index, :length])
+            n_cells = counts[index]
+            times[index, :n_cells] = rng.permutation(original_times[index, :n_cells])
         shuffled[f"shuffled_times_{repeat + 1}"] = score()
 
     multiplicity_score = -counts.astype(float)
-    count_cut = choose_threshold(val["label"], multiplicity_score[indices["validation"]],
+    count_cut = choose_threshold(validation["label"], multiplicity_score[indices["validation"]],
                                  report["target_llp_keep_on_validation"])
     scores = {"part": original_scores, **shuffled,
               "negative_cell_count": multiplicity_score[indices["test"]]}
@@ -61,11 +64,18 @@ def run_diagnostics(root):
     comparisons, differences = {}, {}
     for region, keep in jet_time_regions(test).items():
         subset = test.loc[keep]
-        local = {name: values[keep] for name, values in scores.items()}
-        comparisons[region] = {name: evaluate_scores(subset, values, cuts[name], seed=seed) for name, values in local.items()}
-        differences[region] = {name: {metric: paired_interval(subset, local, cuts, label, seed, model_names=("part", name))
-                                       for label, metric in [(0, "llp_kept"), (1, "unpaired_tagged")]}
-                               for name in shuffled}
+        region_scores = {name: values[keep] for name, values in scores.items()}
+        comparisons[region] = {
+            name: evaluate_scores(subset, values, cuts[name], seed=seed)
+            for name, values in region_scores.items()
+        }
+        differences[region] = {}
+        for name in shuffled:
+            differences[region][name] = {
+                metric: paired_interval(subset, region_scores, cuts, label, seed,
+                                        model_names=("part", name))
+                for label, metric in [(0, "llp_kept"), (1, "unpaired_tagged")]
+            }
     output = outputs / "cell_input_study"
     output.mkdir(exist_ok=True)
     write_json(output / "metrics.json", {

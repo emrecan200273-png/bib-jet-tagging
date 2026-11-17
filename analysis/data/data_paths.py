@@ -1,4 +1,4 @@
-"""Locate private data without storing it in the Git repository."""
+"""Find the local data and verified file list."""
 import os
 from pathlib import Path
 
@@ -17,12 +17,12 @@ def resolve_data_paths(project_root):
     )
     if not data_root.is_dir():
         raise FileNotFoundError(
-            f"Data folder not found: {data_root}. Set PPP_DATA_ROOT to your authorized "
-            "local or mounted CERN/EOS DataForEmre folder. See README.md."
+            f"Data folder not found: {data_root}. Set PPP_DATA_ROOT to your "
+            "DataForEmre folder. See README.md."
         )
     if not manifest.is_file():
         raise FileNotFoundError(
-            f"Private file list not found: {manifest}. Set PPP_DATA_MANIFEST to your "
-            "verified transfer manifest. It is kept outside Git. See README.md."
+            f"File list not found: {manifest}. Set PPP_DATA_MANIFEST to your "
+            "verified manifest. See README.md."
         )
     return data_root, manifest

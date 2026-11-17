@@ -1,4 +1,4 @@
-"""Compare the same selected checkpoint in eval mode on each event split."""
+"""Check train, validation and test losses for the same saved model."""
 
 from pathlib import Path
 
@@ -31,12 +31,10 @@ def _history_arrays(history, selected_epoch):
 
 
 def summarize_generalization(labels, logits_by_split, train_reference_labels, history, selected_epoch):
-    """Measure train/validation/test with dropout disabled at the same checkpoint.
+    """Compare all splits with dropout off and weights from the training sample.
 
-    Callers supply eval-mode logits in the matching label order. Class weights
-    come only from the training reference, and each weighted loss is normalized
-    by that split's weight sum. ROC AUC is unweighted. The original fit history
-    uses its own loss normalization and is reported separately.
+    Logits must follow the label order. Loss is divided by each split's total
+    weight; AUC is unweighted. The training history uses a separate loss scale.
     """
     from sklearn.metrics import roc_auc_score
 
@@ -56,8 +54,7 @@ def summarize_generalization(labels, logits_by_split, train_reference_labels, hi
         if logits.shape != y.shape or not np.isfinite(logits).all():
             raise ValueError(f"{split} logits must be finite and have the same shape as the labels")
         weights = class_weights[y]
-        # Softplus of the signed logit avoids overflow or subtracting nearly
-        # equal large numbers for confident predictions.
+        # This form stays stable even for very large positive or negative logits.
         losses = np.logaddexp(0, np.where(y == 1, -logits, logits))
         weight_sum = weights.sum()
         n_llp, n_unpaired = np.bincount(y, minlength=2)

@@ -1,4 +1,4 @@
-"""Contextual cell attention with optional beam-halo timing coordinates.
+"""Two attention blocks, optionally using distances from BIB timing profiles.
 
 Cells enter in the training-standardized order t, log-relative energy, R, z,
 delta-eta, delta-phi. True mask entries mark real cells.
@@ -22,8 +22,8 @@ C_M_PER_NS = 0.299792458
 
 
 def _augment_qkv(query, key, value, coordinates, weights):
-    """Encode a negative weighted squared-distance bias in the Q/K dot product."""
-    # The omitted -w*xi_i^2 term is constant across the keys for one query.
+    """Add -weight * (position_i - position_j)^2 to the attention scores."""
+    # The position_i^2 term is constant for one query, so softmax cancels it.
     geometry = coordinates.to(query.dtype).unsqueeze(1).expand(-1, query.shape[1], -1, -1)
     weight = weights.to(query.dtype)[None, :, None, :]
     content_width = query.shape[-1]
@@ -61,12 +61,13 @@ class _ContextBlock(nn.Module):
     def forward(self, cells, coordinates, valid_keys):
         batch, count, _ = cells.shape
         qkv = self.qkv(self.attention_norm(cells)).reshape(batch, count, 3, HEADS, HEAD_WIDTH)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
-        q, k, v = _augment_qkv(q, k, v, coordinates, F.softplus(self.log_distance_weights))
-        # Use dropout on the residual output instead of attention weights so
-        # the attention kernel does not need a dense dropout mask.
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
+        query, key, value = _augment_qkv(
+            query, key, value, coordinates, F.softplus(self.log_distance_weights),
+        )
+        # Output dropout avoids allocating a dropout mask for every cell pair.
         contextual = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=valid_keys[:, None, None, :], scale=1.0,
+            query, key, value, attn_mask=valid_keys[:, None, None, :], scale=1.0,
         )[..., :HEAD_WIDTH]
         contextual = contextual.transpose(1, 2).reshape(batch, count, WIDTH)
         cells = cells + self.dropout(self.attention_output(contextual))
@@ -74,7 +75,7 @@ class _ContextBlock(nn.Module):
 
 
 class DeepCellTransformer(nn.Module):
-    """Two contextual blocks followed by a separate learned class query."""
+    """Compare cells twice, then pool them with one learned query."""
 
     def __init__(self, jet_dim, cell_dim, *, physics=False, cell_center, cell_scale):
         super().__init__()

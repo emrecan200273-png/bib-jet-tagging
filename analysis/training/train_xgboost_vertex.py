@@ -26,6 +26,7 @@ JET_ID = ["event_group", "jet_index"]
 
 
 def load_jets(jet_path, vertex_path):
+    """Join vertex counts; return all jets and the zero-vertex unpaired selection."""
     jets = pd.read_csv(jet_path)
     vertices = pd.read_csv(
         vertex_path, usecols=["runNumber", "eventNumber", "vertex_count", "status"],
@@ -63,7 +64,7 @@ def population(frame):
 
 
 def paired_interval(frame, scores, thresholds, label, seed, repeats=2000, model_names=MODEL_NAMES):
-    """Bootstrap the change in jet fraction by resampling the same events for both models."""
+    """Compare models while resampling whole events for the uncertainty."""
     mask = frame["label"].to_numpy() == label
     if not mask.any():
         return None
@@ -71,16 +72,16 @@ def paired_interval(frame, scores, thresholds, label, seed, repeats=2000, model_
     difference = success[1].astype(int) - success[0].astype(int)
     if label == 0:
         difference = -difference
-    codes, events = pd.factorize(frame.loc[mask, "event_group"], sort=False)
-    totals = np.bincount(codes)
-    gains = np.bincount(codes, weights=difference)
+    event_index, events = pd.factorize(frame.loc[mask, "event_group"], sort=False)
+    jets_per_event = np.bincount(event_index)
+    gains_per_event = np.bincount(event_index, weights=difference)
     interval = None
-    if gains.any():
+    if gains_per_event.any():
         rng = np.random.default_rng(seed)
         draws = np.empty(repeats)
         for i in range(repeats):
             sample = rng.integers(0, len(events), len(events))
-            draws[i] = gains[sample].sum() / totals[sample].sum()
+            draws[i] = gains_per_event[sample].sum() / jets_per_event[sample].sum()
         interval = np.quantile(draws, [0.025, 0.975]).tolist()
     return {"fraction_change": float(difference.mean()), "jet_count_change": int(difference.sum()),
             "improved_decisions": int((difference == 1).sum()), "worsened_decisions": int((difference == -1).sum()),
@@ -123,15 +124,18 @@ def kinematic_comparison(train, predictions, model_names=MODEL_NAMES, *, region_
         records.extend(rows)
         shared = [row for row in rows if row["bin_weight"]]
         total_weight = sum(row["bin_weight"] for row in shared)
+        rates = {}
+        for name in model_names:
+            for metric, denominator in [("llp_kept", "llp_jets"), ("unpaired_tagged", "unpaired_jets")]:
+                weighted_sum = sum(
+                    row["bin_weight"] * row[f"{name}_{metric}"] / row[denominator] for row in shared
+                )
+                rates[f"{name}_{metric}_fraction"] = weighted_sum / total_weight if total_weight else None
         pooled[region] = {
             "shared_bins": len(shared), "bin_weight_sum": total_weight,
             "llp_jets_in_shared_bins": sum(row["llp_jets"] for row in shared),
             "unpaired_jets_in_shared_bins": sum(row["unpaired_jets"] for row in shared),
-            "rates": {f"{name}_{metric}_fraction": (
-                sum(row["bin_weight"] * row[f"{name}_{metric}"] / row[denominator] for row in shared) / total_weight
-                if total_weight else None)
-                for name in model_names
-                for metric, denominator in [("llp_kept", "llp_jets"), ("unpaired_tagged", "unpaired_jets")]},
+            "rates": rates,
         }
     return pd.DataFrame(records), pooled
 

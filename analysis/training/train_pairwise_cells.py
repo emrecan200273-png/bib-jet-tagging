@@ -64,11 +64,11 @@ def _paired_changes(test, test_scores, cuts, delayed_cuts, seed, references, tra
 
 
 def run_comparison(project_root, threads, architecture, output_override=None):
-    """Reuse the saved jet selection and scaling, fit new models and write test scores."""
+    """Train a cell model using the saved jet split, scaling and reference scores."""
     root = Path(project_root).resolve()
     outputs = root / "analysis/outputs"
-    graph = architecture == PARTICLE_NET
-    deep = architecture == DEEP
+    use_neighbors = architecture == PARTICLE_NET
+    use_timing_geometry = architecture == DEEP
     report_delayed_kinematics = architecture in (SET, CLUSTER)
     folder, references, trained = COMPARISONS[architecture]
     reference_folder = "cell_model_full_comparison" if architecture == PAIRWISE else COMPARISONS[PAIRWISE][0]
@@ -97,7 +97,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     _, jets = load_jets(jet_table, vertex_map)
     jets = jets.reset_index(drop=True)
     indices = pilot.split_indices(jets)
-    val_frame, test_frame = (jets.iloc[indices[split].numpy()] for split in ("validation", "test"))
+    validation_frame, test_frame = (jets.iloc[indices[split].numpy()] for split in ("validation", "test"))
     reference_predictions = pd.read_csv(reference_predictions_path)
     identity = pilot.JET_IDENTITY
     if not test_frame[identity].reset_index(drop=True).equals(reference_predictions[identity]):
@@ -116,23 +116,23 @@ def run_comparison(project_root, threads, architecture, output_override=None):
     print(f"Mapped {audit['mapped_jets']:,} jets and {audit['overall']['retained_cells']:,} cells", flush=True)
     jet_features = reference_metrics["jet_features"]
     scaling = reference_metrics["scaling_fit_on_train"]
-    scalars = pilot.apply_scaling(jets[jet_features].to_numpy(dtype=np.float32), cells, mask, scaling)
+    scaled_jets = pilot.apply_scaling(jets[jet_features].to_numpy(dtype=np.float32), cells, mask, scaling)
     cell_features = list(CELL_FEATURES)
     if cluster_ids:
         cells = np.concatenate((cells, cluster_ids.pop()[..., None]), axis=-1, dtype=np.float32)
         cell_features.append("cluster_index")
-    inputs = tuple(torch.from_numpy(array) for array in (scalars, cells, mask))
+    inputs = tuple(torch.from_numpy(array) for array in (scaled_jets, cells, mask))
     lengths = inputs[2].sum(dim=1)
     labels = torch.from_numpy(jets["label"].to_numpy(dtype=np.float32))
-    model_dims = (scalars.shape[-1], cells.shape[-1])
+    model_dims = (scaled_jets.shape[-1], cells.shape[-1])
 
-    if deep:
+    if use_timing_geometry:
         model_options = {key: scaling[key] for key in ("cell_center", "cell_scale")}
-    elif graph:
+    elif use_neighbors:
         model_options = {"angular_scale": scaling["cell_scale"][4:6]}
     else:
         model_options = {}
-    max_batch_cells = PARTICLE_NET_BATCH_CELLS if graph else None
+    max_batch_cells = PARTICLE_NET_BATCH_CELLS if use_neighbors else None
     test_scores = {name: reference_predictions[f"{name}_score"].to_numpy() for name in references}
     cuts = {name: reference_metrics["thresholds_from_all_validation_jets"][name] for name in references}
     delayed_cuts = {name: reference_metrics["thresholds_from_delayed_validation_jets"][name] for name in references}
@@ -150,7 +150,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
             max_epochs=settings["max_epochs"], batch_size=batch_size, patience=settings["early_stop_patience"], lengths=lengths,
             model_options=model_options, max_batch_cells=max_batch_cells,
         )
-        model_path = output_dir / (f"{name}.pt" if deep else "neural_model.pt")
+        model_path = output_dir / (f"{name}.pt" if use_timing_geometry else "neural_model.pt")
         saved = {"architecture": name, "model_options": model_options, "state_dict": model.state_dict(),
                  "jet_features": jet_features, "cell_features": cell_features, "scaling": scaling, "max_cells": None}
         logits = {split: pilot.predict_logits(model, inputs, index, batch_size, lengths, max_batch_cells)
@@ -158,7 +158,7 @@ def run_comparison(project_root, threads, architecture, output_override=None):
         validation_scores = logits["validation"].sigmoid().numpy().astype(np.float64)
         test_scores[name] = logits["test"].sigmoid().numpy().astype(np.float64)
         # Choose both tag thresholds on validation jets before evaluating test tags.
-        cuts[name], delayed_cuts[name] = pilot.validation_cuts(val_frame, validation_scores, target)
+        cuts[name], delayed_cuts[name] = pilot.validation_cuts(validation_frame, validation_scores, target)
         histories[name] = history
         generalization[name] = summarize_generalization(
             split_labels, {split: values.numpy() for split, values in logits.items()}, split_labels["train"],

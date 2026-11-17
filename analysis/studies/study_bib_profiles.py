@@ -1,4 +1,4 @@
-"""Compare floating-offset BIB timing templates without training a model."""
+"""Compare cell timing with a constant time and with both BIB beam directions."""
 
 import argparse
 import hashlib
@@ -50,36 +50,40 @@ def _score(flat_variance, bib_variance):
 
 
 def profile_scores(cells):
-    """Return equal-weight both-direction, resolution-weighted both-direction, and Emil replay."""
-    t, x, y, z, sigma, energy, deta, dphi = cells.T
-    spatial_timing = np.column_stack((t, x, y, z))
+    """Return the equal-weight score, resolution-weighted score, and Emil replay."""
+    time, x, y, z, time_sigma, energy, deta, dphi = cells.T
+    spatial_timing = np.column_stack((time, x, y, z))
     usable = np.isfinite(spatial_timing).all(axis=1) & (spatial_timing != INVALID_CELL).all(axis=1)
-    nn_fields = np.column_stack((energy, deta, dphi))
-    nn_cells = usable & (energy > 0) & np.isfinite(nn_fields).all(axis=1)
-    nn_cells &= (nn_fields != INVALID_CELL).all(axis=1)
-    timed = usable & np.isfinite(sigma) & (sigma > 0)
+    model_fields = np.column_stack((energy, deta, dphi))
+    model_cells = usable & (energy > 0) & np.isfinite(model_fields).all(axis=1)
+    model_cells &= (model_fields != INVALID_CELL).all(axis=1)
+    timed_cells = usable & np.isfinite(time_sigma) & (time_sigma > 0)
     distance = np.hypot(np.hypot(x, y), z)
     beam_time = np.column_stack((z - distance, -z - distance)) / C_MM_PER_NS
 
     def compare(selection, weights):
-        times = t[selection]
-        mean = np.average(times, weights=weights)
-        approximate_flat = np.average((times - mean) ** 2, weights=weights)
+        times = time[selection]
+        mean_time = np.average(times, weights=weights)
+        constant_variance = np.average((times - mean_time) ** 2, weights=weights)
         residual = times[:, None] - beam_time[selection]
+        # Fit a common time offset before comparing the two timing shapes.
         centered = residual - np.average(residual, axis=0, weights=weights)
-        bib = np.average(centered**2, axis=0, weights=weights)
+        beam_variances = np.average(centered**2, axis=0, weights=weights)
         mean_z = np.average(z[selection], weights=weights)
-        cov_tz = np.sum(weights * (times - mean) * (z[selection] - mean_z))
-        return approximate_flat, bib, 0 if cov_tz > 0 or (cov_tz == 0 and mean_z >= 0) else 1
+        time_z_covariance = np.sum(weights * (times - mean_time) * (z[selection] - mean_z))
+        positive_direction = time_z_covariance > 0 or (time_z_covariance == 0 and mean_z >= 0)
+        return constant_variance, beam_variances, 0 if positive_direction else 1
 
-    equal, both, replay = np.nan, np.nan, np.nan
-    if nn_cells.sum() >= MIN_CELLS:
-        flat, bib, _ = compare(nn_cells, np.ones(nn_cells.sum()))
-        equal = _score(flat, bib.min())
-    if timed.sum() >= MIN_CELLS:
-        flat, bib, direction = compare(timed, 1 / sigma[timed] ** 2)
-        both, replay = _score(flat, bib.min()), _score(flat, bib[direction])
-    return equal, both, replay
+    equal_weight_score, resolution_weight_score, emil_replay = np.nan, np.nan, np.nan
+    if model_cells.sum() >= MIN_CELLS:
+        constant_variance, beam_variances, _ = compare(model_cells, np.ones(model_cells.sum()))
+        equal_weight_score = _score(constant_variance, beam_variances.min())
+    if timed_cells.sum() >= MIN_CELLS:
+        weights = 1 / time_sigma[timed_cells] ** 2
+        constant_variance, beam_variances, direction = compare(timed_cells, weights)
+        resolution_weight_score = _score(constant_variance, beam_variances.min())
+        emil_replay = _score(constant_variance, beam_variances[direction])
+    return equal_weight_score, resolution_weight_score, emil_replay
 
 
 def _attach_scores(jets, data_root, manifest):

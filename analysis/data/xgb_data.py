@@ -1,7 +1,7 @@
-"""Build the first XGBoost table from verified, read-only ROOT files.
+"""Build the XGBoost jet table from the verified ROOT files.
 
 The target is a working sample label: unpaired = BIB, matched LLP = signal.
-Event identifiers and the existing BIB tagger are retained for checks only.
+Event IDs and Emil's score are kept for checks, not used as model inputs.
 """
 from collections import Counter
 from datetime import datetime, timezone
@@ -125,7 +125,11 @@ def preserve_splits(expanded, old, seed):
     def new_split(key):
         digest = hashlib.blake2b(f"{seed}:{key}".encode(), digest_size=8).digest()
         value = int.from_bytes(digest, "big") / 2**64
-        return "train" if value < .6 else "validation" if value < .8 else "test"
+        if value < .6:
+            return "train"
+        if value < .8:
+            return "validation"
+        return "test"
 
     new = {key: new_split(key) for key in broad.loc[prior.isna(), "event_group"].unique()}
     broad["split"] = prior.fillna(broad["event_group"].map(new))
@@ -218,10 +222,9 @@ def prepare_training_data(
     project_root, output_dir, *, seed=42, min_pt_GeV=30., max_abs_eta=1.7,
     verify_hashes=True, require_mixed_calorimeters=True,
 ):
-    """Extract all events in the two selected groups, apply cuts, and save a table.
+    """Read both samples, apply the jet cuts, and save the table and audit.
 
-    Returns ``(training_frame, audit_dict)``. Only jet and event-ID branches are
-    read, in bounded chunks; cell data and raw files are never changed.
+    Returns (jets, audit). Reads small chunks of jet and event-ID fields.
     """
     if not np.isfinite(min_pt_GeV) or min_pt_GeV < 0:
         raise ValueError("min_pt_GeV must be finite and nonnegative")

@@ -1,8 +1,6 @@
-"""Small scientific figures for the decoded BIB/LLP first-look tables.
+"""Plot the small first-look sample in stored MeV, mm and ns units.
 
-The caller owns decoding, associations and unit validation.  This module uses
-stored values, retains all finite negative timing values, and does not infer
-truth labels or cell-to-jet links.  Each PNG has a matching standalone PDF.
+The cell plots show whole rows, without assigning cells to jets.
 """
 from pathlib import Path
 
@@ -15,7 +13,7 @@ COLORS = {"LLP sample": "#2563a6", "Unpaired sample": "#c66b12"}
 
 
 def _values(frame, column):
-    """Preserve row order while exposing numeric missing values as NaN."""
+    """Read numeric values, keeping missing entries as NaN."""
     return frame[column].to_numpy(dtype=float, na_value=np.nan)
 
 
@@ -70,14 +68,7 @@ def _identifier(row, column):
 
 
 def make_plots(jets, cells, output_dir):
-    """Return ``{figure_stem: absolute_png_path}``; also save matching PDFs.
-
-    ``jets`` contains decoded jet rows with sample, jet_pt, jet_eta,
-    jet_time_ATLAS and jet_time_spread.  ``cells`` contains all decoded cells
-    from at most one stored row per sample, plus source_file, row_index,
-    runNumber, lumiBlock, eventNumber and jet_count metadata.  Missing numeric
-    values are counted as nonfinite exclusions.  No input frames are modified.
-    """
+    """Save PNG/PDF plots and return their PNG paths. Leave inputs unchanged."""
     jet_required = {"sample", "jet_pt", "jet_eta", "jet_time_ATLAS", "jet_time_spread"}
     cell_required = {"sample", "cell_z", "cell_time", "source_file", "row_index",
                      "runNumber", "lumiBlock", "eventNumber", "jet_count"}
@@ -117,19 +108,19 @@ def make_plots(jets, cells, output_dir):
         eta_bins = _bins([kin[s]["eta"] for s in SAMPLES])
         fig, axes = plt.subplots(1, 2, figsize=(12, 5.6))
         fig.subplots_adjust(left=0.075, right=0.98, top=0.82, bottom=0.28, wspace=0.24)
-        fig.suptitle("Stored jet kinematics by source")
+        fig.suptitle("Jet momentum and direction")
         for sample in SAMPLES:
             _histogram(axes[0], kin[sample]["pt"], pt_bins, sample)
             _histogram(axes[1], kin[sample]["eta"], eta_bins, sample)
-        axes[0].set(xscale="log", xlabel="jet_pt (stored units)", ylabel="Fraction of included jets per bin",
-                    title="Positive jet_pt; logarithmic x axis")
-        axes[1].set(xlabel="jet_eta (stored value)", ylabel="Fraction of included jets per bin",
-                    title="Finite jet_eta; linear x axis")
+        axes[0].set(xscale="log", xlabel=r"Jet $p_T$ (MeV)", ylabel="Fraction of jets per bin",
+                    title=r"Positive $p_T$; logarithmic axis")
+        axes[1].set(xlabel=r"Jet $\eta$", ylabel="Fraction of jets per bin",
+                    title=r"Jet direction, $\eta$")
         for ax in axes:
             ax.set_ylim(bottom=0)
             ax.grid(alpha=0.2)
             ax.legend(loc="best", frameon=False)
-        notes = ["Common bins per panel; each source sums to 1. Bin fractions are not physical rates."]
+        notes = ["Same bins for both samples; each sums to 1. Compare shapes, not event rates."]
         for sample in SAMPLES:
             k = kin[sample]
             notes.append(f"{sample}: {k['total']:,} decoded jets; jet_pt excluded {k['pt_nonfinite']:,} nonfinite"
@@ -149,21 +140,21 @@ def make_plots(jets, cells, output_dir):
         spread_bounds = _linear_bounds([timing[s][1] for s in SAMPLES])
         fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), sharex=True, sharey=True)
         fig.subplots_adjust(left=0.08, right=0.98, top=0.81, bottom=0.23, wspace=0.14)
-        fig.suptitle("Stored jet timing and spread")
+        fig.suptitle("Jet time and spread")
         for ax, sample in zip(axes, SAMPLES):
             time, spread, excluded, total = timing[sample]
             ax.scatter(time, spread, s=8, alpha=0.3, color=COLORS[sample],
                        edgecolors="none", rasterized=True)
-            ax.set(xlabel="jet_time_ATLAS (stored units)",
+            ax.set(xlabel="ATLAS jet time (ns)",
                    xlim=time_bounds, ylim=spread_bounds)
             ax.set_title(sample, pad=30)
             ax.grid(alpha=0.2)
             ax.text(0.02, 1.015, f"N={len(time):,} finite pairs / {total:,}; excluded {excluded:,}",
                     transform=ax.transAxes, fontsize=9, ha="left", va="bottom")
-        axes[0].set_ylabel("jet_time_spread (stored units)")
+        axes[0].set_ylabel("Stored time spread (ns)")
         fig.text(0.08, 0.055,
-                 "Shared axes cover every finite pair. Negative stored times/spreads are retained.\n"
-                 "Units, calibrations and source selections remain unconfirmed; these are source comparisons.",
+                 "Same axes for both samples; all finite pairs are shown, including negative values.\n"
+                 "This first look has no physics cuts or event weights.",
                  fontsize=9, ha="left", va="bottom", linespacing=1.5)
         plots["02_jet_timing"] = _save(fig, output_dir, "02_jet_timing")
 
@@ -193,14 +184,14 @@ def make_plots(jets, cells, output_dir):
             ax.set_title(title, fontsize=10, pad=12)
             ax.scatter(z, time, s=9, alpha=0.45, color=COLORS[sample],
                        edgecolors="none", rasterized=True)
-            ax.set(xlabel="cell_z (stored units)", xlim=z_bounds, ylim=cell_time_bounds)
+            ax.set(xlabel="Cell z (mm)", xlim=z_bounds, ylim=cell_time_bounds)
             ax.grid(alpha=0.2)
             ax.text(0, -0.19, f"Stored cells: {len(group):,}; finite pairs: {len(z):,}; excluded: {excluded:,}",
                     transform=ax.transAxes, ha="left", va="top", fontsize=9)
-        axes[0].set_ylabel("cell_time (stored units)")
+        axes[0].set_ylabel("Cell time (ns)")
         fig.text(0.08, 0.035,
-                 "All cells in one stored row; jet links and units unconfirmed. No cells are assigned to a jet here.\n"
-                 "Only nonfinite coordinate/time pairs are excluded. Full finite ranges and negative times are retained.",
+                 "All cells from one row; they are not separated by jet here.\n"
+                 "Only nonfinite pairs are left out. Negative times are kept.",
                  fontsize=9, ha="left", va="bottom", linespacing=1.5)
         plots["03_cell_timing"] = _save(fig, output_dir, "03_cell_timing")
     return plots
