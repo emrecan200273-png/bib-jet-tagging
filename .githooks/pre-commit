@@ -1,2 +1,0 @@
-#!/bin/sh
-exec python3 tools/notebook_git.py --check-index

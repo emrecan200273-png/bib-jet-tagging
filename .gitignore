@@ -3,6 +3,7 @@
 /reference/
 /analysis/provenance/
 /analysis/outputs/
+/analysis/.archive/
 /analysis/remote_schema_inventory.json
 *.root
 *.root.*
