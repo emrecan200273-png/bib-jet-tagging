@@ -19,6 +19,8 @@ I use simulated jets matched to LLP decays for signal. For BIB, I use *unpaired*
 
 ## The notebooks
 
+Open any notebook on GitHub to see the saved figures and the notes underneath. I'd start with the example jet in 01, then look at the last plot in 03 to compare ParT with Emil's score.
+
 | Notebook | What I wanted to find out |
 | --- | --- |
 | [01 · Cells and selections](notebooks/01_cells_and_selections.ipynb) | Which cells belong to one jet, and how does Emil turn their times into a score? |
