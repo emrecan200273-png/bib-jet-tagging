@@ -1,49 +1,49 @@
 # BIB jet tagging
 
-I'm trying to tell two kinds of late jets apart. A long-lived particle (LLP) can travel some distance before it decays. Beam-induced background (BIB) can also leave a late jet, even though the particle that made it was moving close to the speed of light.
+This project compares methods for identifying beam-induced background (BIB) in ATLAS while retaining delayed jets from long-lived particle (LLP) decays. Both can produce a late jet. The arrival times and positions of individual calorimeter cells provide additional information about its origin.
 
-## Why a jet can look late
+## Timing in the calorimeter
 
-ATLAS subtracts the flight time expected for light from the collision point to each cell. Suppose an LLP travels a distance $L$ at speed $\beta c$, then its decay products continue along the same line at speed $c$. The delay comes from the first part of the trip,
+ATLAS subtracts the time light would take to travel from the collision point to each cell. For a simple example, consider an LLP that travels a distance $L$ at speed $\beta c$ before decaying. If its decay products continue along the same line at speed $c$, the delay relative to a prompt particle is
 
 $$
 \Delta t = \frac{L}{\beta c}-\frac{L}{c}
          = \frac{L}{c}\left(\frac{1}{\beta}-1\right).
 $$
 
-For $L=1$ m and $\beta=0.5$, that's about **3.3 ns**. A BIB particle travels along the beam instead. Its cell times change with position along the beam, and assigning its hits to a different 25 ns bunch crossing can shift the whole pattern. That's why I look inside the jet even when I already know its time.
+For $L=1$ m and $\beta=0.5$, the delay is about **3.3 ns**. A BIB particle travelling along the beam produces a timing pattern that varies with position along the beam axis. Assigning its hits to an adjacent bunch crossing shifts their recorded times by 25 ns. The pattern across cells can therefore help distinguish BIB from an LLP decay even when the jet times are similar.
 
-Simone Gallareto compared a flat time with the beam timing pattern for the cells in each **cluster**. Emil's score uses the cells of a whole **jet**. I use his score as a physics reference, then ask what the models can learn from those same jets. [Simone's thesis, chapter 7](https://kth.diva-portal.org/smash/get/diva2%3A1985126/FULLTEXT01.pdf#page=45) · [Emil's ROOT export code](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public)
+Simone Gallareto compared two timing fits to the cells of each **cluster**. One assumes a common arrival time after the flight-time correction. The other uses the time expected for a particle travelling along the beam. Emil's score applies this comparison to the cells of a **jet** and serves as the reference for the machine-learning models. [Simone's thesis, chapter 7](https://kth.diva-portal.org/smash/get/diva2%3A1985126/FULLTEXT01.pdf#page=45) · [Emil's ROOT export code](https://gitlab.cern.ch/ezaya/athjetconstituentsalg-public)
 
-I use simulated jets matched to LLP decays for signal. For BIB, I use *unpaired* crossings, where only one beam has a bunch. They're rich in BIB, though individual jets can have other origins.
+## Notebooks
 
-## The notebooks
+The figures and captions are visible directly on GitHub.
 
-Open any notebook on GitHub to see the saved figures and the notes underneath. I'd start with the example jet in 01, then look at the last plot in 03 to compare ParT with Emil's score.
-
-| Notebook | What I wanted to find out |
+| Notebook | Contents |
 | --- | --- |
-| [01 · Cells and selections](notebooks/01_cells_and_selections.ipynb) | Which cells belong to one jet, and how does Emil turn their times into a score? |
-| [02 · XGBoost baseline](notebooks/02_xgboost_baseline.ipynb) | How does a tree choose a cut? How far can I get with five numbers per jet? |
-| [03 · Train and compare](notebooks/03_train_and_compare.ipynb) | What changes from a jet MLP to Deep Sets, a Set Transformer and a small ParT-inspired model? I compare ParT with Emil on the same jets. |
-| [04 · BIB checks](notebooks/04_bib_checks.ipynb) | Why do so few delayed unpaired jets survive the cuts, and which runs have cell data? |
+| [01 · Cells and selections](notebooks/01_cells_and_selections.ipynb) | Cell positions, projected decay products and both timing fits for one simulated LLP jet. |
+| [02 · XGBoost baseline](notebooks/02_xgboost_baseline.ipynb) | A worked tree split and a classifier trained on five jet variables. |
+| [03 · Model comparison](notebooks/03_train_and_compare.ipynb) | Jet MLP, Deep Sets, Set Transformer and a small ParT-inspired model. The final figure compares ParT with Emil's score on the same delayed jets. |
+| [04 · BIB checks](notebooks/04_bib_checks.ipynb) | Availability of cell data by run and the effect of the momentum and calorimeter cuts on the delayed sample. |
 
-## What I found
+## Results on delayed jets
 
-I picked each cut to keep about 95% of the LLP weight on validation. Here's what happened on the same delayed test jets (ATLAS time above 3 ns).
+The signal sample contains simulated jets matched to an LLP decay. The background sample comes from *unpaired* crossings, where only one beam has a bunch. These crossings are enriched in BIB, but individual jets can have other origins.
 
-| Method | Unpaired tagged | LLP kept | LLP kept after weighting |
+Each method has a score threshold chosen to retain about 95% of the LLP weight on validation. The table shows what happens when those thresholds are applied to the same test jets with ATLAS jet time above 3 ns.
+
+| Method | Unpaired jets tagged | LLP jets retained | Weighted LLP retention |
 | --- | ---: | ---: | ---: |
 | Small ParT-inspired model | 41/44 | 792/803 | 84.7% |
 | Emil's timing score | 5/44 | 784/803 | 97.1% |
 
-I weight the jets so the two samples have similar momentum and direction. ParT tagged more unpaired jets. The LLP jets it lost carried enough weight to pull retention down to 84.7%.
+The weights balance the two samples within bins of transverse momentum and direction. The 11 LLP jets rejected by ParT carry 15.3% of the total LLP weight, which explains the difference between the raw count and weighted retention.
 
-On the test ROC curve I can compare the methods at the same retention. At about 95%, ParT tagged **40/44** and Emil's score tagged **13/44**. All 44 unpaired jets came from run 484258. I'd like to repeat this on a second run.
+The test ROC curve also allows a comparison at the same weighted LLP retention on **test**. At about 95%, ParT tags **40/44** delayed unpaired jets and Emil's score tags **13/44**. All 44 come from run 484258. Testing on a second run requires another unpaired sample with cell data.
 
-## Run it in VS Code
+## Running the notebooks in VS Code
 
-Put the CERN ROOT files in `DataForEmre/` with the same folder names as on CERNBox. From the project folder, run this once with Python 3.12.
+Place the CERN ROOT files under `DataForEmre/` using the folder names from CERNBox. From the project folder, create the Python 3.12 environment and register its notebook kernel.
 
 ```bash
 python3.12 -m venv analysis/.venv
@@ -52,4 +52,4 @@ python -m pip install -r requirements.txt
 python -m ipykernel install --user --name ppp-first-look --display-name "PPP first look"
 ```
 
-Open a notebook, select **PPP first look** and run the cells from the top. The training notebooks save each run in a new folder. [Data folders and saved results](analysis/README.md)
+Open a notebook, select **PPP first look** and run the cells in order. Each training run writes to a separate folder. [Data folders and saved results](analysis/README.md)

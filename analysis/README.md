@@ -1,22 +1,24 @@
-# Where my results go
+# Data and training outputs
 
-Each training run gets its own folder, named by date and time. I use these files when I want to check a result without training again.
+## Input ROOT files
 
-| Local folder | What I open it for |
+The following paths are relative to `DataForEmre/` in the local project.
+
+| Folder | Contents |
 | --- | --- |
-| `outputs/02_xgboost_baseline/` | The XGBoost trees, their test scores and the comparison at similar jet momenta and directions. |
-| `outputs/03_train_and_compare/` | The four trained models, the learning curves and the weighted ROC. |
+| `collision/LLP/N1N2_rpv_1400_10ns/` | 2 files containing simulated LLP jets, the stored match flag and calorimeter cells. |
+| `non_collision/unpaired/physics_Background_NTuple_unsplit_v2/` | 291 files containing unpaired jets and their cells, all from run 484258. |
+| `non_collision/unpaired/user.ezaya.UNPAIRED_nPV_nocells.EXT0/` | 100 files containing reconstructed vertex counts. Run and event numbers link each count to the corresponding cell event. The luminosity block provides an additional check. |
 
-In a run from notebook 03, `weighted_delayed_test_comparison.csv` gives the test counts with the cuts I chose on validation. `weighted_delayed_test_roc_scan.csv` gives the counts when I choose the 95% point on the test curve itself.
+## Training outputs
 
-Older runs are still under `outputs/` with their original names. The last part of [notebook 04](../notebooks/04_bib_checks.ipynb) reads two of those local reports if they're available.
+Each training run writes to a timestamped folder under `analysis/outputs/`.
 
-## Which ROOT files I used
-
-These folders sit under `DataForEmre/` in my local copy.
-
-| Folder | What it gives me |
+| Folder under `outputs/` | Contents |
 | --- | --- |
-| `collision/LLP/N1N2_rpv_1400_10ns/` | 2 files with simulated LLP jets, their match flag and their cells. |
-| `non_collision/unpaired/physics_Background_NTuple_unsplit_v2/` | 291 files with unpaired jets and their cells, all from run 484258. |
-| `non_collision/unpaired/user.ezaya.UNPAIRED_nPV_nocells.EXT0/` | 100 files with vertex counts. I match them to the cells by run and event number and check the luminosity block. |
+| `02_xgboost_baseline/` | Trained trees, test scores and the comparison after matching the samples in transverse momentum and direction. |
+| `03_train_and_compare/` | The four trained neural networks, their learning curves and the weighted ROC curve. |
+
+Notebook 03 saves two tables for the same delayed test jets. In `weighted_delayed_test_comparison.csv`, the thresholds are fixed on validation. In `weighted_delayed_test_roc_scan.csv`, the thresholds correspond to 95% weighted LLP retention on the test ROC curve.
+
+The last section of [notebook 04](../notebooks/04_bib_checks.ipynb) reads two earlier studies from their original folders under `outputs/` when those reports are available.
